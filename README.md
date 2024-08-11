@@ -35,4 +35,4 @@ To use the video translator, follow these steps:
     python translator.py <video_path> <target_language>
     ```
 
-5. Wait for the translation process to complete. The translated video will be saved in the same directory as the original video.
+5. Wait for the translation process to complete. The translated video will be saved in the root directory of the folder created
