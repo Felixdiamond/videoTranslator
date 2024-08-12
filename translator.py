@@ -16,6 +16,7 @@ from pydub.playback import play
 from pydub.silence import detect_nonsilent
 from pydub import effects
 from TTS.api import TTS
+import torch
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -45,12 +46,21 @@ def transcribe_with_whisper(audio_path: str) -> dict:
     print("Transcribing audio with Whisper...")
     model = whisper.load_model("small")
     result = model.transcribe(audio_path, word_timestamps=True)
-    print("Transcription complete.")
+    print(f"Transcription complete. Detected language: {result['language']}")
     return result
 
-def translate_text(text: str, target_language: str) -> str:
-    logging.info(f"Translating text to {target_language}...")
-    translator = pipeline("translation", model=f"Helsinki-NLP/opus-mt-en-{target_language}")
+def translate_text(text: str, source_language: str, target_language: str) -> str:
+    logging.info(f"Translating text from {source_language} to {target_language}...")
+    if source_language == target_language:
+        return text  # No translation needed
+    
+    model_name = f"Helsinki-NLP/opus-mt-{source_language}-{target_language}"
+    try:
+        translator = pipeline("translation", model=model_name)
+    except Exception as e:
+        logging.error(f"Error loading translation model: {str(e)}")
+        logging.info("Attempting to use a multi-language model...")
+        translator = pipeline("translation", model="facebook/mbart-large-50-many-to-many-mmt")
     
     # Split text into smaller chunks to avoid tokenizer length issues
     max_chunk_length = 512
@@ -58,8 +68,15 @@ def translate_text(text: str, target_language: str) -> str:
     
     translated_chunks = []
     for chunk in tqdm(chunks, desc="Translating chunks"):
-        translation = translator(chunk)[0]['translation_text']
-        translated_chunks.append(translation)
+        try:
+            if 'facebook/mbart' in str(translator.model.name_or_path):
+                translation = translator(chunk, src_lang=source_language, tgt_lang=target_language)[0]['translation_text']
+            else:
+                translation = translator(chunk)[0]['translation_text']
+            translated_chunks.append(translation)
+        except Exception as e:
+            logging.error(f"Error translating chunk: {str(e)}")
+            translated_chunks.append(chunk)  # Append original chunk if translation fails
     
     return " ".join(translated_chunks)
 
@@ -70,43 +87,39 @@ def text_to_speech(text: str, language: str, output_path: str, rate: float = 1.0
 
     audio = AudioSegment.from_mp3(output_path)
     
-    # Adjust speech rate
-    
-    # adjusted_audio = audio.speedup(playback_speed=rate)
-    # adjusted_audio.export(output_path, format="mp3")
-    
     return output_path
 
 def text_to_speech_coqui(text: str, language: str, output_path: str, rate: float = 1.0) -> str:
     logging.info(f"Generating speech with Coqui TTS (rate: {rate})...")
     
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+
     # Map language codes to Coqui TTS model names
     language_model_map = {
-        'en': 'tts_models/en/ljspeech/tacotron2-DDC',
-        'es': 'tts_models/es/mai/tacotron2-DDC',
-        'fr': 'tts_models/fr/css10/vits',
-        'de': 'tts_models/de/thorsten/vits',
-        'it': 'tts_models/it/mai_female/vits',
-        # Add more languages as needed
+        'en': 'tts_models/en/ljspeech/fast_pitch',
+        'es': 'tts_models/es/mai/fastspeech2-mai',
+        'fr': 'tts_models/fr/mai/fastspeech2-mai',
+        'de': 'tts_models/de/thorsten/tacotron2-DDC',
+        'it': 'tts_models/it/mai_female/glow-tts',
+        'pl': 'tts_models/pl/mai_female/vits',
+        'ru': 'tts_models/ru/multi-dataset/vits',
     }
+
     
-    # Select the appropriate model based on the target language
-    model_name = language_model_map.get(language, 'tts_models/en/ljspeech/tacotron2-DDC')
+    if language not in language_model_map:
+        raise ValueError(f"Language '{language}' is not supported by Coqui TTS.")
+
+    tts = TTS(model_name=language_model_map[language]).to(device)
     
-    # Initialize TTS
-    tts = TTS(model_name)
-    
-    # Generate speech
-    tts.tts_to_file(text=text, file_path=output_path)
-    
-    # Load the generated audio
-    audio = AudioSegment.from_file(output_path)
-    
-    # Adjust speech rate
-    if rate != 1.0:
-        adjusted_audio = audio.speedup(playback_speed=rate)
-        adjusted_audio.export(output_path, format="mp3")
-    
+    tts.tts_to_file(text=text, file_path=output_path, rate=rate)
+
+    try:
+        audio = AudioSegment.from_file(output_path)
+    except Exception as e:
+        logging.error(f"Error loading audio file: {str(e)}")
+        return None
+
     return output_path
 
 def fit_audio_to_duration(audio: AudioSegment, target_duration: int) -> AudioSegment:
@@ -147,7 +160,21 @@ def apply_audio_compression(audio: AudioSegment, target_duration: int) -> AudioS
     compression_ratio = len(audio) / target_duration
     return effects.compress_dynamic_range(audio, threshold=-20, ratio=compression_ratio, attack=5, release=50)
 
-def create_synced_audio(original_audio: AudioSegment, transcript: dict, translated_text: str, target_language: str, project_dir: str) -> AudioSegment:
+def stretch_audio(audio: AudioSegment, factor: float) -> AudioSegment:
+    """
+    Stretch audio using rubberband for better quality time-stretching.
+    Requires rubberband-cli to be installed.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_in:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_out:
+            audio.export(temp_in.name, format="wav")
+            
+            stretch_ratio = 1 / factor
+            os.system(f"rubberband -c 4 -t {stretch_ratio} {temp_in.name} {temp_out.name}")
+            
+            return AudioSegment.from_wav(temp_out.name)
+
+def create_synced_audio(original_audio: AudioSegment, transcript: dict, translated_text: str, source_language: str, target_language: str, project_dir: str) -> AudioSegment:
     logging.info("Creating synced translated audio...")
     
     final_audio = AudioSegment.silent(duration=len(original_audio))
@@ -159,7 +186,7 @@ def create_synced_audio(original_audio: AudioSegment, transcript: dict, translat
         duration = end_time - start_time
         
         # Translate segment text
-        translated_segment = translate_text(segment['text'], target_language)
+        translated_segment = translate_text(segment['text'], source_language, target_language)
         
         logging.info(f"Segment {i}: Original: '{segment['text']}', Translated: '{translated_segment}'")
         
@@ -171,8 +198,8 @@ def create_synced_audio(original_audio: AudioSegment, transcript: dict, translat
         tts_output_path = os.path.join(segments_dir, f"segment_{i:04d}.mp3")
         
         try:
-            text_to_speech(translated_segment, target_language, tts_output_path)
-            translated_audio = AudioSegment.from_mp3(tts_output_path)
+            text_to_speech_coqui(translated_segment, target_language, tts_output_path)
+            translated_audio = AudioSegment.from_file(tts_output_path)
             
             # Check if the translated audio is longer than the original segment
             if len(translated_audio) > duration:
@@ -214,12 +241,10 @@ def process_video(video_path: str, target_language: str):
         audio_path = os.path.join(project_dir, 'audio', 'extracted_audio.wav')
         extract_audio(video_path, audio_path)
         
-        # Transcribe with word timestamps
+        # Transcribe with word timestamps and detect language
         transcript_result = transcribe_with_whisper(audio_path)
-        # save the actual transcript result
-        # transcript_result_path = os.path.join(project_dir, 'transcripts', 'transcript_result.json')
-        # with open(transcript_result_path, 'w') as f:
-        #     f.write(str(transcript_result['segments'][0]['text']))
+        source_language = transcript_result['language']
+        print(f"Source language from Whisper: {source_language}, target language: {target_language}")
 
         # Save transcript
         transcript_path = os.path.join(project_dir, 'transcripts', 'transcript.txt')
@@ -227,7 +252,7 @@ def process_video(video_path: str, target_language: str):
             f.write(transcript_result['text'])
         
         # Translate full text
-        translated_text = translate_text(transcript_result['text'], target_language)
+        translated_text = translate_text(transcript_result['text'], source_language, target_language)
         
         # Save translation
         translation_path = os.path.join(project_dir, 'translations', 'translation.txt')
@@ -237,7 +262,7 @@ def process_video(video_path: str, target_language: str):
         # Create synced translated audio
         original_audio = AudioSegment.from_wav(audio_path)
         print(f"Original audio duration: {len(original_audio)}")
-        synced_audio = create_synced_audio(original_audio, transcript_result, translated_text, target_language, project_dir)
+        synced_audio = create_synced_audio(original_audio, transcript_result, translated_text, source_language, target_language, project_dir)
         
         # Export synced audio
         final_audio_path = os.path.join(project_dir, 'audio', 'final_audio.wav')
@@ -259,6 +284,7 @@ if __name__ == "__main__":
         sys.exit(1)
     
     video_path = sys.argv[1]
+
     target_language = sys.argv[2]
     
     process_video(video_path, target_language)
