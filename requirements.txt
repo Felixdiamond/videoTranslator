@@ -1,8 +1,10 @@
-openai-whisper
-moviepy
-pydub
-transformers
-tqdm
-TTS
 sentencepiece
 sacremoses
+librosa
+openai-whisper
+gtts
+pydub
+transformers
+soundfile
+moviepy
+tqdm

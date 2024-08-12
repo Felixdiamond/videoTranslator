@@ -5,6 +5,7 @@ import tempfile
 import math
 import shutil
 from typing import List, Tuple
+import numpy as np
 
 import whisper
 from moviepy.editor import VideoFileClip, AudioFileClip, CompositeAudioClip
@@ -15,8 +16,9 @@ from tqdm import tqdm
 from pydub.playback import play
 from pydub.silence import detect_nonsilent
 from pydub import effects
-from TTS.api import TTS
 import torch
+import librosa
+import soundfile as sf
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -44,7 +46,7 @@ def extract_audio(video_path: str, output_path: str) -> str:
 def transcribe_with_whisper(audio_path: str) -> dict:
     logging.info("Transcribing audio with Whisper...")
     print("Transcribing audio with Whisper...")
-    model = whisper.load_model("small")
+    model = whisper.load_model("tiny")
     result = model.transcribe(audio_path, word_timestamps=True)
     print(f"Transcription complete. Detected language: {result['language']}")
     return result
@@ -160,19 +162,62 @@ def apply_audio_compression(audio: AudioSegment, target_duration: int) -> AudioS
     compression_ratio = len(audio) / target_duration
     return effects.compress_dynamic_range(audio, threshold=-20, ratio=compression_ratio, attack=5, release=50)
 
-def stretch_audio(audio: AudioSegment, factor: float) -> AudioSegment:
-    """
-    Stretch audio using rubberband for better quality time-stretching.
-    Requires rubberband-cli to be installed.
-    """
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_in:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_out:
-            audio.export(temp_in.name, format="wav")
-            
-            stretch_ratio = 1 / factor
-            os.system(f"rubberband -c 4 -t {stretch_ratio} {temp_in.name} {temp_out.name}")
-            
-            return AudioSegment.from_wav(temp_out.name)
+def adaptive_time_stretch(audio_path, target_duration):
+    # Check if the file exists
+    if not os.path.exists(audio_path):
+        print(f"Error: File {audio_path} does not exist")
+        return None
+
+    # Get file info
+    try:
+        file_info = sf.info(audio_path)
+        print(f"File info: {file_info}")
+    except Exception as e:
+        print(f"Error getting file info: {str(e)}")
+
+    # Load the audio file
+    try:
+        y, sr = librosa.load(audio_path, sr=None)
+        print(f"Loaded audio. Shape: {y.shape}, Sample rate: {sr}")
+        print(f"Audio min: {np.min(y)}, max: {np.max(y)}, mean: {np.mean(y)}")
+    except Exception as e:
+        print(f"Error loading audio: {str(e)}")
+        return None
+
+    # Check for silent audio
+    if np.allclose(y, 0):
+        print("Warning: Audio appears to be silent")
+        return None
+
+    # Calculate the stretch factor
+    original_duration = librosa.get_duration(y=y, sr=sr)
+    stretch_factor = original_duration / target_duration
+    print(f"Original duration: {original_duration}, Stretch factor: {stretch_factor}")
+
+    # Time-stretch the audio
+    try:
+        y_stretched = librosa.effects.time_stretch(y, rate=stretch_factor)
+        print(f"Stretched audio shape: {y_stretched.shape}")
+    except Exception as e:
+        print(f"Error during time stretch: {str(e)}")
+        return None
+
+    # Ensure the stretched audio matches the target duration
+    if len(y_stretched) > target_duration * sr:
+        y_stretched = y_stretched[:int(target_duration * sr)]
+    elif len(y_stretched) < target_duration * sr:
+        y_stretched = librosa.util.fix_length(y_stretched, size=int(target_duration * sr))
+
+    # Save the stretched audio
+    output_path = 'stretched_audio.wav'
+    try:
+        sf.write(output_path, y_stretched, sr)
+        print(f"Saved stretched audio to {output_path}")
+    except Exception as e:
+        print(f"Error saving stretched audio: {str(e)}")
+        return None
+
+    return output_path
 
 def create_synced_audio(original_audio: AudioSegment, transcript: dict, translated_text: str, source_language: str, target_language: str, project_dir: str) -> AudioSegment:
     logging.info("Creating synced translated audio...")
@@ -185,41 +230,34 @@ def create_synced_audio(original_audio: AudioSegment, transcript: dict, translat
         end_time = int(segment['end'] * 1000)
         duration = end_time - start_time
         
-        # Translate segment text
         translated_segment = translate_text(segment['text'], source_language, target_language)
-        
-        logging.info(f"Segment {i}: Original: '{segment['text']}', Translated: '{translated_segment}'")
         
         if not translated_segment.strip():
             logging.warning(f"Skipping empty translated segment for: '{segment['text']}'")
             continue
         
-        # Generate speech for translated segment
         tts_output_path = os.path.join(segments_dir, f"segment_{i:04d}.mp3")
         
         try:
-            text_to_speech_coqui(translated_segment, target_language, tts_output_path)
+            text_to_speech(translated_segment, target_language, tts_output_path)
             translated_audio = AudioSegment.from_file(tts_output_path)
             
-            # Check if the translated audio is longer than the original segment
             if len(translated_audio) > duration:
-                # Try to speed up the audio to fit the duration
-                speed_factor = len(translated_audio) / duration
-                adjusted_audio = translated_audio.speedup(playback_speed=speed_factor)
+                # Use adaptive time stretching
+                stretched_audio_path = adaptive_time_stretch(tts_output_path, duration / 1000)
+                adjusted_audio = AudioSegment.from_file(stretched_audio_path)
                 
-                # If still too long, use advanced methods to fit the duration
+                # If still too long, apply additional techniques
                 if len(adjusted_audio) > duration:
+                    adjusted_audio = remove_silences(adjusted_audio)
                     adjusted_audio = fit_audio_to_duration(adjusted_audio, duration)
             else:
                 adjusted_audio = translated_audio
             
-            # Ensure the adjusted audio is not longer than the segment duration
             adjusted_audio = adjusted_audio[:duration]
             
-            # Save the adjusted audio segment
             adjusted_audio.export(tts_output_path, format="mp3")
             
-            # Cut out the silent part from the final audio and insert the translated segment
             final_audio = final_audio[:start_time] + adjusted_audio + final_audio[end_time:]
         except Exception as e:
             logging.error(f"Error processing segment {i}: {str(e)}")
