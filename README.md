@@ -1,38 +1,61 @@
-## VideoTranslator
+# VideoTranslator ヾ(⌐■_■)ノ♪
 
-My trial to create an open source video translator since i couldn't find any :( .
-I made sure to use services available for free to make it accessible to everyone.
+## Welcome to my open-source video translation adventure! (ﾉ◕ヮ◕)ﾉ*:･ﾟ✧
 
-Right now i have a basic script that works yeah, but needs improvement on the playback speed
+I got tired of waiting for someone else to make a cool open-source video translator, so I decided to create one myself! This project aims to make video translation accessible to everyone by using free services. It's still a work in progress, but hey, Rome wasn't built in a day, right? (￣ω￣)
 
-Stay tuned (✿◡‿◡)
+### Current Status
+The basic script is up and running! ٩(◕‿◕｡)۶ But like any budding masterpiece, it needs some TLC, especially in the playback speed department. I'm working on it, so stay tuned! (✿◠‿◠)
 
-If you have any ideas to further improve the synchronisation between the video and splitted audio, feel free to contribute or contact me.
+### How You Can Help
+Got any brilliant ideas to improve the sync between video and split audio? Don't be shy! Contribute or drop me a line. Let's make this translator awesome together! ᕦ(ò_óˇ)ᕤ
 
-ありがとう。(oﾟvﾟ)ノ
+## Features (ﾉ´ヮ`)ﾉ*: ･ﾟ
+- Translates videos to your desired language
+- Uses freely available services (because who doesn't love free stuff?)
+- Works with various video formats
+- Preserves original sound effects and music
 
-## Usage
+## Installation (⌐■_■)
 
-To use the video translator, follow these steps:
+1. Clone this bad boy:
+   ```
+   git clone https://github.com/Felixdiamond/videoTranslator.git
+   ```
 
-1. Clone the repository to your local machine:
-    ```
-    git clone https://github.com/Felixdiamond/videoTranslator.git
-    ```
+2. Install the cool kids (I mean, dependencies):
+   ```
+   pip install -r requirements.txt
+   ```
 
-2. Install the required dependencies:
-    ```
-    pip install -r requirements.txt
-    ```
+## Usage (╯°□°）╯︵ ┻━┻
 
-3. Navigate to the project directory:
-    ```
-    cd videoTranslator
-    ```
+1. Navigate to the project directory:
+   ```
+   cd videoTranslator
+   ```
 
-4. Run the translator script:
-    ```
-    python translator.py <video_path> <target_language>
-    ```
+2. Run the magic translator script:
+   ```
+   python translator.py <path_to_your_video> <target_language>
+   ```
 
-5. Wait for the translation process to complete. The translated video will be saved in the root directory of the folder created
+3. Grab a snack and wait for the translation magic to happen! ✨
+
+4. Find your shiny new translated video in the root directory of the created folder.
+
+## Known Issues (;´༎ຶД༎ຶ`)
+- Playback speed needs some work (it's not perfect... yet!)
+- Resource hungry (or maybe that's just because i'm using an 8gb ram pc with 512 HDD lol)
+- Time consuming (again, maybe just my pc)
+- May occasionally translate "hello" to "goodbye" (just kidding, but you never know with AI!)
+
+## Future Plans (づ｡◕‿‿◕｡)づ
+- Improve synchronization (because timing is everything in comedy and video translation)
+- Add support for more languages (maybe even Klingon?)
+- Make the UI so pretty, you'll want to frame it
+
+## Contributing ᕕ( ᐛ )ᕗ
+Got ideas? Found a bug? Want to add Klingon support? Contributions are always welcome! Feel free to open an issue or submit a pull request.
+
+ありがとう for checking out my project! Let's make video translation great again! (oﾟvﾟ)ノ

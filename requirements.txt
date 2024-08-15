@@ -8,3 +8,6 @@ transformers
 soundfile
 moviepy
 tqdm
+TTS
+numpy>=1.24.3
+noisereduce

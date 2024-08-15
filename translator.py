@@ -4,14 +4,15 @@ import logging
 import tempfile
 import math
 import shutil
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 import numpy as np
+import concurrent.futures
 
 import whisper
 from moviepy.editor import VideoFileClip, AudioFileClip, CompositeAudioClip
 from gtts import gTTS
 from pydub import AudioSegment
-from transformers import pipeline
+from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
 from tqdm import tqdm
 from pydub.playback import play
 from pydub.silence import detect_nonsilent
@@ -19,9 +20,28 @@ from pydub import effects
 import torch
 import librosa
 import soundfile as sf
+import noisereduce as nr
+
+from TTS.utils.manage import ModelManager
+from TTS.utils.synthesizer import Synthesizer
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+# Define a dictionary mapping languages to their respective models
+LANGUAGE_MODEL_MAP: Dict[str, Dict[str, str]] = {
+    "en": {"model_name": "tts_models/en/ljspeech/fast_pitch"},
+    "es": {"model_name": "tts_models/es/mai/tacotron2-DDC"},
+    "fr": {"model_name": "tts_models/fr/mai/tacotron2-DDC"},
+    "de": {"model_name": "tts_models/de/thorsten/vits"},
+    "it": {"model_name": "tts_models/it/mai_female/glow-tts"},
+    "pt": {"model_name": "tts_models/pt/cv/vits"},
+    "pl": {"model_name": "tts_models/pl/mai_female/vits"},
+    "tr": {"model_name": "tts_models/tr/common-voice/glow-tts"},
+    "ru": {"model_name": "tts_models/ru/multi-dataset/vits"},
+    "nl": {"model_name": "tts_models/nl/mai/tacotron2-DDC"},
+}
 
 def create_project_structure(video_path: str, target_language: str) -> str:
     print("Creating project structure...")
@@ -46,7 +66,8 @@ def extract_audio(video_path: str, output_path: str) -> str:
 def transcribe_with_whisper(audio_path: str) -> dict:
     logging.info("Transcribing audio with Whisper...")
     print("Transcribing audio with Whisper...")
-    model = whisper.load_model("tiny")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = whisper.load_model("small", device=device)
     result = model.transcribe(audio_path, word_timestamps=True)
     print(f"Transcription complete. Detected language: {result['language']}")
     return result
@@ -54,15 +75,19 @@ def transcribe_with_whisper(audio_path: str) -> dict:
 def translate_text(text: str, source_language: str, target_language: str) -> str:
     logging.info(f"Translating text from {source_language} to {target_language}...")
     if source_language == target_language:
-        return text  # No translation needed
+        return text
     
     model_name = f"Helsinki-NLP/opus-mt-{source_language}-{target_language}"
     try:
-        translator = pipeline("translation", model=model_name)
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+        translator = pipeline("translation", model=model, tokenizer=tokenizer, device=0 if torch.cuda.is_available() else -1)
     except Exception as e:
         logging.error(f"Error loading translation model: {str(e)}")
         logging.info("Attempting to use a multi-language model...")
-        translator = pipeline("translation", model="facebook/mbart-large-50-many-to-many-mmt")
+        tokenizer = AutoTokenizer.from_pretrained("facebook/mbart-large-50-many-to-many-mmt")
+        model = AutoModelForSeq2SeqLM.from_pretrained("facebook/mbart-large-50-many-to-many-mmt")
+        translator = pipeline("translation", model=model, tokenizer=tokenizer, device=0 if torch.cuda.is_available() else -1)
     
     # Split text into smaller chunks to avoid tokenizer length issues
     max_chunk_length = 512
@@ -92,175 +117,236 @@ def text_to_speech(text: str, language: str, output_path: str, rate: float = 1.0
     return output_path
 
 def text_to_speech_coqui(text: str, language: str, output_path: str, rate: float = 1.0) -> str:
-    logging.info(f"Generating speech with Coqui TTS (rate: {rate})...")
+    """
+    Generate speech from text using Coqui TTS models.
     
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-
-    # Map language codes to Coqui TTS model names
-    language_model_map = {
-        'en': 'tts_models/en/ljspeech/fast_pitch',
-        'es': 'tts_models/es/mai/fastspeech2-mai',
-        'fr': 'tts_models/fr/mai/fastspeech2-mai',
-        'de': 'tts_models/de/thorsten/tacotron2-DDC',
-        'it': 'tts_models/it/mai_female/glow-tts',
-        'pl': 'tts_models/pl/mai_female/vits',
-        'ru': 'tts_models/ru/multi-dataset/vits',
-    }
-
+    Args:
+        text (str): The text to convert to speech.
+        language (str): The language code (e.g., 'en', 'es', 'fr').
+        output_path (str): The path to save the generated audio file.
+        rate (float): The speech rate (not directly supported by Coqui TTS, but kept for compatibility).
     
-    if language not in language_model_map:
-        raise ValueError(f"Language '{language}' is not supported by Coqui TTS.")
+    Returns:
+        str: The path to the generated audio file.
+    """
+    if language not in LANGUAGE_MODEL_MAP:
+        raise ValueError(f"Unsupported language: {language}")
 
-    tts = TTS(model_name=language_model_map[language]).to(device)
+    model_name = LANGUAGE_MODEL_MAP[language]["model_name"]
     
-    tts.tts_to_file(text=text, file_path=output_path, rate=rate)
-
-    try:
-        audio = AudioSegment.from_file(output_path)
-    except Exception as e:
-        logging.error(f"Error loading audio file: {str(e)}")
-        return None
-
+    # Initialize the ModelManager
+    manager = ModelManager()
+    
+    # Download and load the model
+    model_path, config_path, _ = manager.download_model(model_name)
+    synthesizer = Synthesizer(
+        tts_checkpoint=model_path,
+        tts_config_path=config_path,
+    )
+    
+    # Generate speech
+    wav = synthesizer.tts(text)
+    
+    # Save the generated audio
+    synthesizer.save_wav(wav, output_path)
+    
     return output_path
 
-def fit_audio_to_duration(audio: AudioSegment, target_duration: int) -> AudioSegment:
-    """
-    Use advanced methods to fit the audio to the target duration.
-    """
-    # Method 1: Gradual speed-up
-    current_speed = 1.0
-    max_speed = 2.0
-    step = 0.1
+def summarize_text(text: str, max_length: int = 512) -> str:
+    print("Summarizing text...")
+    if len(text) <= max_length:
+        return text
     
-    while len(audio) > target_duration and current_speed < max_speed:
-        current_speed += step
-        audio = audio.speedup(playback_speed=current_speed)
+    summarizer = pipeline("summarization", model="facebook/bart-large-cnn", device=0 if torch.cuda.is_available() else -1)
     
-    # Method 2: If still too long, remove silences
-    if len(audio) > target_duration:
-        audio = remove_silences(audio)
+    # Adjust max_length based on input length
+    max_length = min(max_length, len(text) // 2)
+    min_length = min(30, max_length - 1)
     
-    # Method 3: If still too long, use audio compression
-    if len(audio) > target_duration:
-        audio = apply_audio_compression(audio, target_duration)
+    summary = summarizer(text, max_length=max_length, min_length=min_length, do_sample=False)[0]['summary_text']
     
-    # Final truncation if still necessary
-    return audio[:target_duration]
+    return summary
 
-def remove_silences(audio: AudioSegment, silence_thresh=-50.0, min_silence_len=100) -> AudioSegment:
-    """
-    Remove silences from the audio to shorten its duration.
-    """
-    non_silent_ranges = detect_nonsilent(audio, min_silence_len=min_silence_len, silence_thresh=silence_thresh)
-    return sum([audio[start:end] for start, end in non_silent_ranges])
-
-def apply_audio_compression(audio: AudioSegment, target_duration: int) -> AudioSegment:
-    """
-    Apply audio compression to fit the audio within the target duration.
-    """
-    compression_ratio = len(audio) / target_duration
-    return effects.compress_dynamic_range(audio, threshold=-20, ratio=compression_ratio, attack=5, release=50)
-
-def adaptive_time_stretch(audio_path, target_duration):
-    # Check if the file exists
-    if not os.path.exists(audio_path):
-        print(f"Error: File {audio_path} does not exist")
+def process_segment(segment, original_audio, source_language, target_language, segments_dir, i):
+    start_time = int(segment['start'] * 1000)
+    end_time = int(segment['end'] * 1000)
+    original_duration = end_time - start_time
+    
+    translated_segment = translate_text(segment['text'], source_language, target_language)
+    
+    if not translated_segment.strip():
+        logging.warning(f"Skipping empty translated segment for: '{segment['text']}'")
         return None
-
-    # Get file info
+    
+    tts_output_path = os.path.join(segments_dir, f"segment_{i:04d}.wav")
+    
     try:
-        file_info = sf.info(audio_path)
-        print(f"File info: {file_info}")
+        # Generate initial TTS audio
+        try:
+            text_to_speech_coqui(translated_segment, target_language, tts_output_path)
+        except Exception as e:
+            logging.error(f"Coqui TTS failed on segment {i}: {str(e)}")
+            logging.info(f"Switching to gtts")
+            text_to_speech(translated_segment, target_language, tts_output_path)
+        translated_audio = AudioSegment.from_file(tts_output_path)
+        
+        # Check if summarization is needed
+        if len(translated_audio) - original_duration >= 3000:
+            logging.info(f"Summarizing segment {i} due to length difference")
+            summarized_text = summarize_text(translated_segment, max_length=len(translated_segment) // 2)
+            try:
+                text_to_speech_coqui(summarized_text, target_language, tts_output_path)
+            except Exception as e:
+                logging.error(f"TTS failed on segment {i}: {str(e)}")
+                logging.info(f"Switching to gtts")
+                text_to_speech(summarized_text, target_language, tts_output_path)
+            translated_audio = AudioSegment.from_file(tts_output_path)
+        
+        # Apply advanced time stretching
+        stretched_audio = advanced_time_stretch(translated_audio, original_duration)
+        
+        # Apply audio normalization
+        normalized_audio = effects.normalize(stretched_audio)
+        
+        # Apply subtle noise reduction
+        noise_reduced_audio = noise_reduction(normalized_audio)
+        
+        # Apply voice enhancement
+        enhanced_audio = enhance_voice(noise_reduced_audio)
+        
+        enhanced_audio.export(tts_output_path, format="wav")
+        
+        return (start_time, enhanced_audio)
+        
     except Exception as e:
-        print(f"Error getting file info: {str(e)}")
-
-    # Load the audio file
-    try:
-        y, sr = librosa.load(audio_path, sr=None)
-        print(f"Loaded audio. Shape: {y.shape}, Sample rate: {sr}")
-        print(f"Audio min: {np.min(y)}, max: {np.max(y)}, mean: {np.mean(y)}")
-    except Exception as e:
-        print(f"Error loading audio: {str(e)}")
+        logging.error(f"Error processing segment {i}: {str(e)}")
         return None
 
-    # Check for silent audio
-    if np.allclose(y, 0):
-        print("Warning: Audio appears to be silent")
-        return None
+def adaptive_segment_processing(segments, original_audio, source_language, target_language, project_dir):
+    segments_dir = os.path.join(project_dir, 'translated_segments')
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+        futures = [executor.submit(process_segment, segment, original_audio, source_language, target_language, segments_dir, i) 
+                   for i, segment in enumerate(segments)]
+        
+        processed_segments = []
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            if result:
+                processed_segments.append(result)
+    
+    return processed_segments
 
+def noise_reduction(audio: AudioSegment, reduction_amount=3):
+    """
+    Apply a simple noise reduction to the audio segment.
+    """
+    samples = np.array(audio.get_array_of_samples())
+    reduced_noise = nr.reduce_noise(y=samples, sr=audio.frame_rate, prop_decrease=reduction_amount/10)
+    return AudioSegment(
+        reduced_noise.tobytes(),
+        frame_rate=audio.frame_rate,
+        sample_width=audio.sample_width,
+        channels=audio.channels
+    )
+
+def enhance_voice(audio: AudioSegment):
+    """
+    Enhance the voice in the audio segment by applying EQ and compression.
+    """
+    # Apply a mild EQ to enhance voice frequencies
+    enhanced = audio.high_pass_filter(80)  # Remove low rumble
+    enhanced = enhanced.low_pass_filter(8000)  # Remove high hiss
+    # enhanced = enhanced.gain(3)
+    
+    # Apply compression to even out the volume
+    enhanced = effects.compress_dynamic_range(enhanced, threshold=-20, ratio=4.0, attack=5, release=50)
+    
+    return enhanced
+
+def advanced_time_stretch(audio: AudioSegment, target_duration: int) -> AudioSegment:
+    logging.info(f"Performing advanced time stretch. Input duration: {len(audio) / 1000:.2f}s, Target duration: {target_duration / 1000:.2f}s")
+    
+    # Convert pydub AudioSegment to numpy array
+    samples = np.array(audio.get_array_of_samples()).astype(np.float32) / 32767.0
+    
+    # If stereo, convert to mono
+    if audio.channels == 2:
+        samples = samples.reshape((-1, 2)).mean(axis=1)
+    
     # Calculate the stretch factor
-    original_duration = librosa.get_duration(y=y, sr=sr)
-    stretch_factor = original_duration / target_duration
-    print(f"Original duration: {original_duration}, Stretch factor: {stretch_factor}")
-
-    # Time-stretch the audio
-    try:
-        y_stretched = librosa.effects.time_stretch(y, rate=stretch_factor)
-        print(f"Stretched audio shape: {y_stretched.shape}")
-    except Exception as e:
-        print(f"Error during time stretch: {str(e)}")
-        return None
-
+    stretch_factor = target_duration / len(audio)
+    
+    # Limit the stretch factor to avoid extreme stretching
+    max_stretch = 2.0
+    min_stretch = 0.5
+    stretch_factor = max(min(stretch_factor, max_stretch), min_stretch)
+    
+    logging.info(f"Adjusted stretch factor: {stretch_factor:.2f}")
+    
+    # Use librosa for time stretching
+    stretched_samples = librosa.effects.time_stretch(samples, rate=1/stretch_factor)
+    
     # Ensure the stretched audio matches the target duration
-    if len(y_stretched) > target_duration * sr:
-        y_stretched = y_stretched[:int(target_duration * sr)]
-    elif len(y_stretched) < target_duration * sr:
-        y_stretched = librosa.util.fix_length(y_stretched, size=int(target_duration * sr))
+    if len(stretched_samples) > target_duration * audio.frame_rate // 1000:
+        stretched_samples = stretched_samples[:target_duration * audio.frame_rate // 1000]
+    elif len(stretched_samples) < target_duration * audio.frame_rate // 1000:
+        padding = np.zeros(target_duration * audio.frame_rate // 1000 - len(stretched_samples))
+        stretched_samples = np.concatenate([stretched_samples, padding])
+    
+    # Convert back to int16 for pydub
+    stretched_samples = (stretched_samples * 32767).astype(np.int16)
+    
+    # Convert back to pydub AudioSegment
+    stretched_audio = AudioSegment(
+        stretched_samples.tobytes(),
+        frame_rate=audio.frame_rate,
+        sample_width=2,
+        channels=1
+    )
+    
+    logging.info(f"Stretched audio duration: {len(stretched_audio) / 1000:.2f}s")
+    
+    return stretched_audio
 
-    # Save the stretched audio
-    output_path = 'stretched_audio.wav'
-    try:
-        sf.write(output_path, y_stretched, sr)
-        print(f"Saved stretched audio to {output_path}")
-    except Exception as e:
-        print(f"Error saving stretched audio: {str(e)}")
-        return None
-
-    return output_path
+def preserve_sound_effects(original_audio: AudioSegment, synced_speech: AudioSegment, transcript: dict) -> AudioSegment:
+    logging.info("Preserving sound effects and music...")
+    
+    # Create a silent audio segment of the same length as the original
+    final_audio = AudioSegment.silent(duration=len(original_audio))
+    
+    # Overlay the synced speech
+    final_audio = final_audio.overlay(synced_speech)
+    
+    # Define speech segments
+    speech_segments = [(int(seg['start'] * 1000), int(seg['end'] * 1000)) for seg in transcript['segments']]
+    
+    # Find non-speech segments (potential sound effects and music)
+    non_speech_segments = []
+    last_end = 0
+    for start, end in speech_segments:
+        if start > last_end:
+            non_speech_segments.append((last_end, start))
+        last_end = end
+    if len(original_audio) > last_end:
+        non_speech_segments.append((last_end, len(original_audio)))
+    
+    # Overlay non-speech segments from the original audio
+    for start, end in non_speech_segments:
+        non_speech_audio = original_audio[start:end]
+        final_audio = final_audio.overlay(non_speech_audio, position=start)
+    
+    return final_audio
 
 def create_synced_audio(original_audio: AudioSegment, transcript: dict, translated_text: str, source_language: str, target_language: str, project_dir: str) -> AudioSegment:
     logging.info("Creating synced translated audio...")
     
     final_audio = AudioSegment.silent(duration=len(original_audio))
-    segments_dir = os.path.join(project_dir, 'translated_segments')
     
-    for i, segment in enumerate(transcript['segments']):
-        start_time = int(segment['start'] * 1000)
-        end_time = int(segment['end'] * 1000)
-        duration = end_time - start_time
-        
-        translated_segment = translate_text(segment['text'], source_language, target_language)
-        
-        if not translated_segment.strip():
-            logging.warning(f"Skipping empty translated segment for: '{segment['text']}'")
-            continue
-        
-        tts_output_path = os.path.join(segments_dir, f"segment_{i:04d}.mp3")
-        
-        try:
-            text_to_speech(translated_segment, target_language, tts_output_path)
-            translated_audio = AudioSegment.from_file(tts_output_path)
-            
-            if len(translated_audio) > duration:
-                # Use adaptive time stretching
-                stretched_audio_path = adaptive_time_stretch(tts_output_path, duration / 1000)
-                adjusted_audio = AudioSegment.from_file(stretched_audio_path)
-                
-                # If still too long, apply additional techniques
-                if len(adjusted_audio) > duration:
-                    adjusted_audio = remove_silences(adjusted_audio)
-                    adjusted_audio = fit_audio_to_duration(adjusted_audio, duration)
-            else:
-                adjusted_audio = translated_audio
-            
-            adjusted_audio = adjusted_audio[:duration]
-            
-            adjusted_audio.export(tts_output_path, format="mp3")
-            
-            final_audio = final_audio[:start_time] + adjusted_audio + final_audio[end_time:]
-        except Exception as e:
-            logging.error(f"Error processing segment {i}: {str(e)}")
+    processed_segments = adaptive_segment_processing(transcript['segments'], original_audio, source_language, target_language, project_dir)
+    
+    for start_time, audio_segment in processed_segments:
+        final_audio = final_audio.overlay(audio_segment, position=start_time)
     
     return final_audio
 
@@ -300,11 +386,14 @@ def process_video(video_path: str, target_language: str):
         # Create synced translated audio
         original_audio = AudioSegment.from_wav(audio_path)
         print(f"Original audio duration: {len(original_audio)}")
-        synced_audio = create_synced_audio(original_audio, transcript_result, translated_text, source_language, target_language, project_dir)
+        synced_speech = create_synced_audio(original_audio, transcript_result, translated_text, source_language, target_language, project_dir)
         
-        # Export synced audio
+        # Preserve sound effects and music
+        final_audio = preserve_sound_effects(original_audio, synced_speech, transcript_result)
+        
+        # Export final audio
         final_audio_path = os.path.join(project_dir, 'audio', 'final_audio.wav')
-        synced_audio.export(final_audio_path, format="wav")
+        final_audio.export(final_audio_path, format="wav")
         
         # Create final video
         output_video_path = os.path.join(project_dir, f"translated_{os.path.basename(video_path)}")
@@ -322,7 +411,6 @@ if __name__ == "__main__":
         sys.exit(1)
     
     video_path = sys.argv[1]
-
     target_language = sys.argv[2]
     
     process_video(video_path, target_language)
