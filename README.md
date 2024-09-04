@@ -18,6 +18,9 @@ Got any brilliant ideas to improve the sync between video and split audio? Don't
 
 ## Installation (⌐■_■)
 
+### Note
+You need python 3.11.9 to run this, thats the only python version I've tested that works with this script
+
 1. Clone this bad boy:
    ```
    git clone https://github.com/Felixdiamond/videoTranslator.git
