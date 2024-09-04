@@ -30,7 +30,7 @@ def main():
     frontend_process = run_command("npm run dev", cwd="video-translator")
 
     print("\nBoth servers are now running!")
-    print("Backend server is running on http://localhost:5000")
+    print("Backend server is running on http://localhost:8000")
     print("Frontend server is running on http://localhost:3000")
     print("\nPress CTRL+C to stop both servers.")
 

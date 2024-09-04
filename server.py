@@ -1,12 +1,27 @@
-import os
-import shutil
-from pathlib import Path
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, File, UploadFile, WebSocket
 from fastapi.responses import StreamingResponse
 from typing import Optional
+from pathlib import Path
+import os
+import shutil
+import logging
 from pydub import AudioSegment
 
 app = FastAPI()
+
+# Allow CORS for specific origins
+origins = [
+    "http://localhost:3000",  # Replace with your frontend URL if different
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 UPLOAD_DIRECTORY = Path("uploaded_files")
 UPLOAD_DIRECTORY.mkdir(parents=True, exist_ok=True)
