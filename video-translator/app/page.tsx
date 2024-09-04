@@ -4,7 +4,7 @@ import React, { useState, useRef } from "react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
-import { Loader2, Upload, FolderOpen } from "lucide-react";
+import { Loader2, FolderOpen } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import {
   Select,
@@ -29,6 +29,7 @@ const LANGUAGE_MODEL_MAP = {
 
 export default function Home() {
   const [videoPath, setVideoPath] = useState("");
+  const [selectedFile, setSelectedFile] = useState(null);
   const [targetLanguage, setTargetLanguage] = useState("");
   const [isTranslating, setIsTranslating] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -37,23 +38,16 @@ export default function Home() {
   const { toast } = useToast();
   const fileInputRef = useRef(null);
 
-  const handlePathChange = (event) => {
-    setVideoPath(event.target.value);
-  };
-
-  const handleFileBrowse = () => {
-    fileInputRef.current.click();
-  };
-
   const handleFileSelect = (event) => {
     const file = event.target.files[0];
     if (file) {
-      setVideoPath(file.path);
+      setSelectedFile(file);
+      setVideoPath(file.name);
     }
   };
 
   const handleTranslate = async () => {
-    if (!videoPath || !targetLanguage) {
+    if (!selectedFile || !targetLanguage) {
       toast({
         title: "Error",
         description: "Please select a video file and target language.",
@@ -64,12 +58,24 @@ export default function Home() {
 
     setIsTranslating(true);
     setProgress(0);
-    setStatus("Initiating translation...");
+    setStatus("Uploading and translating...");
 
     try {
+      // Upload the file
+      const formData = new FormData();
+      formData.append('file', selectedFile);
+
+      const uploadResponse = await fetch('http://localhost:8000/upload', {
+        method: 'POST',
+        body: formData,
+      });
+      const uploadData = await uploadResponse.json();
+      const filePath = uploadData.filePath;
+
+      // Start translation
       const ws = new WebSocket(
         `ws://localhost:8000/translate/${encodeURIComponent(
-          videoPath
+          filePath
         )}/${targetLanguage}`
       );
 
@@ -135,12 +141,11 @@ export default function Home() {
                 type="text"
                 placeholder="/path/to/your/video.mp4"
                 value={videoPath}
-                onChange={handlePathChange}
-                className="flex-grow mr-2"
                 readOnly
+                className="flex-grow mr-2"
               />
               <Button
-                onClick={handleFileBrowse}
+                onClick={() => fileInputRef.current.click()}
                 className="bg-slate-200 text-slate-700 hover:bg-slate-300"
               >
                 <FolderOpen className="w-5 h-5" />

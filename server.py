@@ -1,22 +1,23 @@
 import os
-import sys
-import logging
-import time
-from typing import List, Tuple
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import shutil
+from pathlib import Path
+from fastapi import FastAPI, File, UploadFile, WebSocket
 from fastapi.responses import StreamingResponse
-from translator import (
-    create_project_structure,
-    extract_audio,
-    transcribe_with_whisper,
-    translate_text,
-    text_to_speech_coqui,
-    create_synced_audio,
-    preserve_sound_effects,
-    create_final_video,
-)
+from typing import Optional
+from pydub import AudioSegment
 
 app = FastAPI()
+
+UPLOAD_DIRECTORY = Path("uploaded_files")
+UPLOAD_DIRECTORY.mkdir(parents=True, exist_ok=True)
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    file_location = UPLOAD_DIRECTORY / file.filename
+    with open(file_location, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+    
+    return {"filePath": str(file_location)}
 
 @app.websocket("/translate/{video_path}/{target_language}")
 async def translate_video(websocket: WebSocket, video_path: str, target_language: str):
