@@ -5,7 +5,7 @@ import venv
 import shutil # For checking if git is available
 
 MIN_PYTHON_VERSION = (3, 11, 0) # Minimum required Python version (3.11.0)
-RECOMMENDED_PYTHON_VERSION_STR = "3.11.9" # For display
+RECOMMENDED_PYTHON_VERSION_STR = ">= 3.11.9"
 
 def check_python_version():
     print("Checking Python version...")

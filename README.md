@@ -67,7 +67,6 @@ This project now uses MeloTTS. You'll need to clone its repository and install i
     # source venv/bin/activate
     pip install -r requirements.txt
     ```
-    *The `requirements.txt` will be updated to include new dependencies like `accelerate` and ensure PyTorch with CUDA support is specified if possible (though direct CUDA version in `requirements.txt` can be tricky).*
 
 ### Option 2: The Fancy Setup (Automated)
 1.  **Clone the repository:**
@@ -80,8 +79,6 @@ This project now uses MeloTTS. You'll need to clone its repository and install i
     ```bash
     python setup.py
     ```
-3.  **Follow script prompts.** It will guide you through installing Python if not present and other dependencies.
-
 ## Usage (╯°□°）╯︵ ┻━┻
 
 ### If you chose Option 1 (CLI)
