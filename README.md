@@ -39,6 +39,8 @@ The full 28-minute video wasn't translated as it would take a significant amount
 ### Note on MeloTTS
 This project now uses MeloTTS. You'll need to clone its repository and install it. The `setup.py` script attempts to handle this.
 
+**NOTE**: If you run into an error while installing fugashi, install mecab: `sudo apt-get install mecab libmecab-dev mecab-ipadic-utf8`
+
 ### Option 1: The Classic (CLI Lovers)
 1.  **Clone this repository:**
     ```bash
