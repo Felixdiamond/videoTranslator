@@ -1,17 +1,38 @@
-sentencepiece
-sacremoses
-librosa
-openai-whisper
-gtts
-pydub
-transformers
-soundfile
-moviepy
-tqdm
-TTS
-numpy>=1.24.3
-noisereduce
+# Core ML/AI Libraries
+torch # For GPU support, user might need to install a specific CUDA version:
+# e.g., pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+torchvision
+torchaudio
+transformers # For translation and summarization models
+accelerate # For GPU optimization and mixed precision
+openai-whisper # For transcription
 
+# Audio Processing
+librosa
+soundfile
+pydub
+noisereduce # For noise reduction
+
+# Text-to-Speech
+gtts # Google Text-to-Speech (fallback)
+# MeloTTS is installed separately, see README.md for instructions.
+# unidic is also installed separately for Japanese support in MeloTTS.
+
+# Video Processing
+moviepy
+
+# Web Server & API
 fastapi
-uvicorn
-websockets
+uvicorn[standard] # Includes websockets and other standard dependencies
+# websockets # Now included with uvicorn[standard]
+
+# Utilities
+tqdm # Progress bars
+psutil # For system performance monitoring
+sentencepiece # Dependency for some Hugging Face tokenizers
+sacremoses # Dependency for some Hugging Face tokenizers
+numpy
+
+# Note: TTS (from Coqui TTS) was previously listed but the new script uses MeloTTS or gTTS.
+# If Coqui TTS is still desired as an option, it would need to be re-added.
+# The new script does not import from 'TTS.utils' anymore.

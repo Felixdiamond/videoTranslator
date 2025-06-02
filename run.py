@@ -9,24 +9,35 @@ def run_command(command, cwd=None):
         print(f"Error running command: {e}")
         sys.exit(1)
 
-def get_venv_activate_command():
+def get_venv_python_executable(project_root):
+    venv_dir = os.path.join(project_root, "venv")
     if sys.platform == "win32":
-        return "call venv\\Scripts\\activate"
+        python_exe = os.path.join(venv_dir, "Scripts", "python.exe")
     else:
-        return "source venv/bin/activate"
+        python_exe = os.path.join(venv_dir, "bin", "python")
+    
+    if not os.path.exists(python_exe):
+        print(f"Error: Python executable not found in virtual environment: {python_exe}")
+        print("Please ensure the virtual environment 'venv' exists and was created correctly (e.g., by running setup.py).")
+        sys.exit(1)
+    return python_exe
 
 def main():
     # Ensure we're in the project root directory
     project_root = os.path.dirname(os.path.abspath(__file__))
     os.chdir(project_root)
 
+    # Get Python executable from venv
+    python_from_venv = get_venv_python_executable(project_root)
+
     # Start backend server
-    print("Starting backend server...")
-    activate_command = get_venv_activate_command()
-    backend_process = run_command(f"{activate_command} && python server.py")
+    print(f"Starting backend server using: {python_from_venv} server.py")
+    # Running "python_from_venv server.py" directly ensures it uses the venv's Python and packages
+    backend_process = run_command(f'"{python_from_venv}" server.py')
+
 
     # Start frontend server
-    print("Starting frontend server...")
+    print("Starting frontend server (npm run dev)...")
     frontend_process = run_command("npm run dev", cwd="video-translator")
 
     print("\nBoth servers are now running!")

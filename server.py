@@ -1,19 +1,26 @@
-from fastapi import FastAPI, File, UploadFile, WebSocket
+from fastapi import FastAPI, File, UploadFile, WebSocket, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse # Keep for potential future use
 from typing import Optional
 from pathlib import Path
 import os
 import shutil
 import logging
-from pydub import AudioSegment
-from translator import create_project_structure, extract_audio, transcribe_with_whisper, translate_text, create_synced_audio, preserve_sound_effects, create_final_video
+import asyncio # Added for running blocking IO in a thread
+
+# Import the main processing function and language map from the updated translator
+from translator import process_video, LANGUAGE_MODEL_MAP
 
 app = FastAPI()
 
+# Configure basic logging for the server
+# translator.py now configures its own logger, so this will be for server-specific logs
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 # Allow CORS for specific origins
 origins = [
-    "http://localhost:3000",
+    "http://localhost:3000", # Assuming your Next.js frontend runs on this port
 ]
 
 app.add_middleware(
@@ -29,57 +36,68 @@ UPLOAD_DIRECTORY.mkdir(parents=True, exist_ok=True)
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
-    file_location = UPLOAD_DIRECTORY / file.filename
-    with open(file_location, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-    return {"filePath": str(file_location)}
+    # Sanitize filename to prevent directory traversal or invalid characters
+    filename = Path(file.filename).name # Basic sanitization
+    if not filename:
+        raise HTTPException(status_code=400, detail="Invalid filename.")
 
-@app.websocket("/translate/{video_path}/{target_language}")
-async def translate_video(websocket: WebSocket, video_path: str, target_language: str):
-    await websocket.accept()
+    file_location = UPLOAD_DIRECTORY / filename
     try:
-        # Create project structure
-        project_dir = create_project_structure(video_path, target_language)
-        
-        # Extract audio
-        audio_path = os.path.join(project_dir, 'audio', 'extracted_audio.wav')
-        extract_audio(video_path, audio_path)
-        await websocket.send_text("Audio extracted")
-        
-        # Transcribe with Whisper
-        transcript_result = transcribe_with_whisper(audio_path)
-        source_language = transcript_result['language']
-        await websocket.send_text(f"Source language: {source_language}, Target language: {target_language}")
-        
-        # Translate full text
-        translated_text = translate_text(transcript_result['text'], source_language, target_language)
-        await websocket.send_text("Text translated")
-        
-        # Create synced translated audio
-        original_audio = AudioSegment.from_wav(audio_path)
-        synced_speech = create_synced_audio(original_audio, transcript_result, translated_text, source_language, target_language, project_dir)
-        await websocket.send_text("Synced audio created")
-        
-        # Preserve sound effects and music
-        final_audio = preserve_sound_effects(original_audio, synced_speech, transcript_result)
-        await websocket.send_text("Sound effects preserved")
-        
-        # Export final audio
-        final_audio_path = os.path.join(project_dir, 'audio', 'final_audio.wav')
-        final_audio.export(final_audio_path, format="wav")
-        await websocket.send_text("Final audio exported")
-        
-        # Create final video
-        output_video_path = os.path.join(project_dir, f"translated_{os.path.basename(video_path)}")
-        create_final_video(video_path, final_audio_path, output_video_path)
-        await websocket.send_text(f"Translation complete. Output video: {output_video_path}")
-        
+        with open(file_location, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+        logger.info(f"File '{filename}' uploaded to '{file_location}'")
     except Exception as e:
-        logging.error(f"An error occurred: {str(e)}")
-        await websocket.send_text(f"Error: {str(e)}")
+        logger.error(f"Failed to save uploaded file '{filename}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Could not save file: {e}")
+
+    # Return the path relative to the project root, as expected by the frontend and translator.py
+    return {"filePath": str(file_location.relative_to(Path.cwd()))}
+
+
+@app.websocket("/translate/{video_path:path}/{target_language}")
+async def translate_video_ws(websocket: WebSocket, video_path: str, target_language: str):
+    await websocket.accept()
+    logger.info(f"WebSocket connection accepted for video: {video_path}, target language: {target_language}")
+
+    if target_language not in LANGUAGE_MODEL_MAP:
+        error_msg = f"Unsupported target language: {target_language}. Supported languages are: {list(LANGUAGE_MODEL_MAP.keys())}"
+        logger.error(error_msg)
+        await websocket.send_text(f"Error: {error_msg}")
+        await websocket.close()
+        return
+
+    actual_video_path = Path.cwd() / video_path
+
+    if not actual_video_path.exists():
+        error_msg = f"Video file not found at resolved path: {actual_video_path} (original path: {video_path})"
+        logger.error(error_msg)
+        await websocket.send_text(f"Error: {error_msg}")
+        await websocket.close()
+        return
+
+    try:
+        await websocket.send_text(f"Translation process initiated for '{actual_video_path.name}' to '{target_language}'.")
+        logger.info(f"Starting translation task for {actual_video_path} to {target_language}...")
+        await websocket.send_text("Video processing in progress... This may take a while. Please check server logs for detailed progress.")
+
+        output_video_file_path = await asyncio.to_thread(process_video, str(actual_video_path), target_language)
+
+        if output_video_file_path:
+            logger.info(f"Translation successful. Output video: {output_video_file_path}")
+            relative_output_path = str(Path(output_video_file_path).relative_to(Path.cwd()))
+            await websocket.send_text(f"Translation complete. Output video: {relative_output_path}")
+        else:
+            logger.error("Translation process completed but no output video path was returned.")
+            await websocket.send_text("Error: Translation completed but no output file was generated. Check server logs.")
+
+    except Exception as e:
+        logger.error(f"An error occurred during translation for {actual_video_path}: {str(e)}", exc_info=True)
+        await websocket.send_text(f"Error: An unexpected error occurred: {str(e)}")
     finally:
+        logger.info(f"Closing WebSocket connection for {actual_video_path.name}")
         await websocket.close()
 
 if __name__ == "__main__":
     import uvicorn
+    logger.info("Starting Video Translator server on http://0.0.0.0:8000")
     uvicorn.run(app, host="0.0.0.0", port=8000)
