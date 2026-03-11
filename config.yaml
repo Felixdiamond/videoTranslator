@@ -1,0 +1,38 @@
+# config.yaml — videoTranslator optional user overrides
+# ([PLAN_h.md L835–L843](PLAN_h.md) — Issue 8)
+#
+# All values default to "auto" / null, meaning the pipeline selects the best
+# option automatically based on detected hardware.  Uncomment and edit any key
+# to lock in a specific value.
+
+# Hardware tier override.
+# Allowed: auto | cpu_low | cpu_high | gpu_low | gpu_medium | gpu_high
+hardware_tier: auto
+
+# Whisper model override (overrides the tier-default from WHISPER_MODEL_TIERS).
+# Examples: base | small | medium | large-v3 | large-v3-turbo
+whisper_model: null
+
+# NLLB-200 translation model override (overrides TRANSLATION_MODEL_TIERS).
+# Examples: facebook/nllb-200-distilled-600M | facebook/nllb-200-1.3B | facebook/nllb-200-3.3B
+translation_model: null
+
+# TTS backend: melo | qwen3 | gtts
+tts_mode: melo
+
+# Qwen3-TTS model size (only used when tts_mode: qwen3).
+# Allowed: 0.6B | 1.7B
+qwen3_model_size: "1.7B"
+
+# Whether to extract a voice-clone reference from the source video
+# (only active when tts_mode: qwen3).
+enable_voice_cloning: true
+
+# MeloTTS speaker ID override (null = auto-select default for target language).
+# Examples: EN-US | EN-BR | EN_INDIA | EN-AU | EN-Default | ES | FR | ZH | JP | KR
+melo_speaker_id: null
+
+# Demucs model override for vocal source separation.
+# null = tier-default (htdemucs_ft for gpu_high, htdemucs otherwise)
+# Allowed: htdemucs | htdemucs_ft | htdemucs_6s | hdemucs_mmi
+demucs_model: null

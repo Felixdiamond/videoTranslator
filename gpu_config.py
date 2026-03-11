@@ -127,3 +127,21 @@ class GPUOptimizer:
 # Global GPU optimizer instance
 # This will be initialized when the module is imported.
 gpu_optimizer = GPUOptimizer()
+
+
+def detect_hardware_tier() -> str:
+    """
+    Returns one of: 'cpu_low', 'cpu_high', 'gpu_low', 'gpu_medium', 'gpu_high'.
+    Used to select appropriately-sized models for the available hardware.
+    """
+    import psutil
+    if not torch.cuda.is_available():
+        ram_gb = psutil.virtual_memory().total / 1024 ** 3
+        return "cpu_high" if ram_gb >= 16 else "cpu_low"
+
+    vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+    if vram_gb < 6:
+        return "gpu_low"
+    if vram_gb < 12:
+        return "gpu_medium"
+    return "gpu_high"

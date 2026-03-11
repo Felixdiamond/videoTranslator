@@ -2,21 +2,31 @@
 torch # For GPU support, user might need to install a specific CUDA version:
 # e.g., pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 torchvision
-torchaudio
-transformers # For translation and summarization models
+torchaudio>=2.1.0
+transformers>=4.40.0  # For NLLB-200 translation (NllbTokenizer, AutoModelForSeq2SeqLM)
 accelerate # For GPU optimization and mixed precision
-openai-whisper # For transcription
+# openai-whisper replaced by faster-whisper + whisperx
+faster-whisper>=1.2.1
+whisperx>=3.1.0
 
 # Audio Processing
 librosa
 soundfile
 pydub
 noisereduce # For noise reduction
+pyrubberband>=0.3.0  # High-quality time-stretch (requires: sudo apt-get install rubberband-cli)
+demucs>=4.0.1       # Source separation for SFX preservation (Issue 2)
 
 # Text-to-Speech
 gtts # Google Text-to-Speech (fallback)
 # MeloTTS is installed separately, see README.md for instructions.
 # unidic is also installed separately for Japanese support in MeloTTS.
+# Qwen3-TTS (voice cloning, 10 languages) — install manually:
+#   pip install git+https://github.com/QwenLM/Qwen3-TTS.git
+#   Optional GPU acceleration: pip install flash-attn
+# Model weights are downloaded automatically on first use:
+#   Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice  (2 GB VRAM, fast)
+#   Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice  (4–5 GB VRAM, quality)
 
 # Video Processing
 moviepy
@@ -29,6 +39,7 @@ uvicorn[standard] # Includes websockets and other standard dependencies
 # Utilities
 tqdm # Progress bars
 psutil # For system performance monitoring
+pyyaml # For config.yaml loading (config overrides)
 sentencepiece # Dependency for some Hugging Face tokenizers
 sacremoses # Dependency for some Hugging Face tokenizers
 numpy

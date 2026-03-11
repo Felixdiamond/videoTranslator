@@ -55,7 +55,14 @@ async def upload_file(file: UploadFile = File(...)):
 
 
 @app.websocket("/translate/{video_path:path}/{target_language}")
-async def translate_video_ws(websocket: WebSocket, video_path: str, target_language: str):
+async def translate_video_ws(
+    websocket: WebSocket,
+    video_path: str,
+    target_language: str,
+    tts_mode: str = "melo",
+    speaker_id: Optional[str] = None,
+    enable_voice_cloning: bool = False,
+):
     await websocket.accept()
     logger.info(f"WebSocket connection accepted for video: {video_path}, target language: {target_language}")
 
@@ -80,7 +87,14 @@ async def translate_video_ws(websocket: WebSocket, video_path: str, target_langu
         logger.info(f"Starting translation task for {actual_video_path} to {target_language}...")
         await websocket.send_text("Video processing in progress... This may take a while. Please check server logs for detailed progress.")
 
-        output_video_file_path = await asyncio.to_thread(process_video, str(actual_video_path), target_language)
+        output_video_file_path = await asyncio.to_thread(
+            process_video,
+            str(actual_video_path),
+            target_language,
+            tts_mode=tts_mode,
+            melo_speaker_id=speaker_id,
+            enable_voice_cloning=enable_voice_cloning,
+        )
 
         if output_video_file_path:
             logger.info(f"Translation successful. Output video: {output_video_file_path}")
