@@ -83,6 +83,16 @@ if APP_CONFIG:
 accelerator = gpu_optimizer.accelerator
 device = gpu_optimizer.device
 
+# --- Device announcement ---
+if device.type == "cuda":
+    gpu_name = torch.cuda.get_device_name(device)
+    vram_gb  = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
+    logging.info(f"[Device] Running on GPU: {gpu_name} ({vram_gb:.1f} GB VRAM)")
+else:
+    import psutil
+    ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+    logging.info(f"[Device] Running on CPU (no CUDA device found). System RAM: {ram_gb:.1f} GB")
+
 # Language mapping for MeloTTS and fallback gTTS language codes
 LANGUAGE_MODEL_MAP: Dict[str, Dict[str, str]] = {
     "en": {"melo_language": "EN", "speaker_id": "EN-US", "gtts_lang": "en"},
@@ -220,6 +230,10 @@ def transcribe_with_whisperx(audio_path: str) -> dict:
     compute_type = "float16" if device.type == "cuda" else "int8"
     device_str = str(device).split(":")[0]  # "cuda" or "cpu"
 
+    if device.type == "cuda":
+        logging.info(f"[WhisperX] Using GPU: {torch.cuda.get_device_name(device)}")
+    else:
+        logging.info("[WhisperX] Using CPU (no GPU available)")
     logging.info(f"Loading WhisperX model: {model_size!r}, compute={compute_type!r}, device={device_str!r}")
     try:
         wx_model = whisperx.load_model(
@@ -548,6 +562,11 @@ def load_translation_model(tier: str) -> Tuple:
     if cfg_model:
         logging.info(f"[config] translation_model override: {cfg_model!r}")
         model_id = cfg_model
+    if model_device == "cuda" and torch.cuda.is_available():
+        logging.info(f"[Translation] Using GPU: {torch.cuda.get_device_name(device)}")
+    else:
+        model_device = "cpu"  # fall back gracefully if CUDA was requested but unavailable
+        logging.info("[Translation] Using CPU")
     logging.info(f"Loading translation model: {model_id} on {model_device} ({dtype_str})")
 
     dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
@@ -994,6 +1013,10 @@ def separate_vocals_from_audio(
     Uses htdemucs_ft (fine-tuned hybrid Transformer Demucs) — best quality.
     Requires ~3GB VRAM on GPU; automatically falls back to overlap-add on CPU.
     """
+    if device_obj.type == "cuda":
+        logging.info(f"[Demucs] Using GPU: {torch.cuda.get_device_name(device_obj)}")
+    else:
+        logging.info("[Demucs] Using CPU (no GPU available — separation will be slower)")
     logging.info(f"[Demucs] Separating vocals from {audio_path} using {model_name!r}...")
     demucs_model = demucs_get_model(model_name)
     device_str = str(device_obj).split(":")[0]
