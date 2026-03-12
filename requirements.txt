@@ -1,8 +1,20 @@
 # Core ML/AI Libraries
-torch # For GPU support, user might need to install a specific CUDA version:
-# e.g., pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-torchvision
-torchaudio>=2.1.0
+# ── torch triplet must be installed together at matching versions ──────────────
+# For CUDA 12.1 (Kaggle T4/P100, most cloud GPUs as of 2026):
+#   pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
+#       --index-url https://download.pytorch.org/whl/cu121
+# For CUDA 11.8:
+#   pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
+#       --index-url https://download.pytorch.org/whl/cu118
+# CPU-only fallback:
+#   pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1
+#
+# DO NOT let pip upgrade torchvision/torchaudio independently — a mismatch
+# between torch and torchvision causes "operator torchvision::nms does not
+# exist" at runtime (torchvision C-extension ABI incompatibility).
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
 transformers>=4.40.0  # For NLLB-200 translation (NllbTokenizer, AutoModelForSeq2SeqLM)
 accelerate # For GPU optimization and mixed precision
 # openai-whisper replaced by faster-whisper + whisperx
