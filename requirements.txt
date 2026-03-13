@@ -12,7 +12,7 @@ torchaudio
 transformers>=4.40.0
 accelerate
 faster-whisper>=1.2.1
-whisperx>=3.1.0
+whisperx>=3.8.2
 
 # Audio
 librosa

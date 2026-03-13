@@ -284,6 +284,14 @@ def transcribe_with_whisperx(audio_path: str) -> dict:
             f"Falling back to Whisper segment timestamps."
         )
 
+    if "text" not in result:
+        segments = result.get("segments") or []
+        result["text"] = " ".join(
+            (seg.get("text") or "").strip()
+            for seg in segments
+            if isinstance(seg, dict) and (seg.get("text") or "").strip()
+        )
+
     return result
 
 
@@ -1438,7 +1446,12 @@ def process_video(
 
             transcript_text_path = os.path.join(project_dir, 'transcripts', 'transcript.txt')
             with open(transcript_text_path, 'w', encoding='utf-8') as f:
-                f.write(transcript_data['text'])
+                fallback_text = " ".join(
+                    (seg.get('text') or '').strip()
+                    for seg in (transcript_data.get('segments') or [])
+                    if isinstance(seg, dict) and (seg.get('text') or '').strip()
+                )
+                f.write(transcript_data.get('text') or fallback_text)
 
             # 4. Translation — NLLB-200 (load → batch translate all segments → unload before TTS)
             with performance_monitor.timer("translation_model_loading"):
