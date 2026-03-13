@@ -1,127 +1,295 @@
-# VideoTranslator ヾ(⌐■_■)ノ♪
+# videoTranslator
 
-## Welcome to my open-source video translation adventure! (ﾉ◕ヮ◕)ﾉ*:･ﾟ✧
+Open-source video dubbing pipeline that translates speech, synthesizes new voice audio, preserves background sound effects/music, and muxes a final translated video.
 
-I got tired of waiting for someone else to make a cool open-source video translator, so I decided to create one myself! This project aims to make video translation accessible to everyone by leveraging powerful open-source AI models. (￣ω￣)
+This project has grown from a simple script into a full stack workflow:
+- Python backend pipeline (`translator.py`)
+- FastAPI + WebSocket service (`server.py`)
+- Next.js frontend (`video-translator/`)
+- Hardware-aware model selection + config overrides (`config.yaml`)
+- Multi-engine TTS (`MeloTTS` as primary, `Qwen3-TTS` for **voice cloning**, `gTTS` fallback)
 
-### Current Status & ✨ Major Update! ✨
-The script has undergone a significant upgrade! ٩(◕‿◕｡)۶ We've integrated **MeloTTS** for higher-quality, more natural-sounding voice synthesis, and implemented **GPU acceleration** (where available) for faster processing. The entire pipeline, from transcription to final video generation, is now more robust and optimized. Performance monitoring has also been added to help track resource usage.
+---
 
-### How You Can Help
-Got brilliant ideas to further improve synchronization, add more voice options, or enhance performance? Don't be shy! Contribute or drop me a line. Let's make this translator awesome together! ᕦ(ò_óˇ)ᕤ
+## What’s implemented now
 
-## Features (ﾉ´ヮ`)ﾉ*: ･ﾟ
-- **High-Quality Translation & TTS**: Translates videos using advanced models and synthesizes speech with MeloTTS (falling back to gTTS if needed).
-- **Multiple Languages Supported**: Current support includes English, Spanish, French, Chinese, Japanese, Korean, German, and Portuguese (see `translator.py` for the latest `LANGUAGE_MODEL_MAP`).
-- **GPU Accelerated**: Leverages your GPU (if CUDA is available and PyTorch is set up correctly) for faster transcription, translation, and other ML tasks.
-- **Preserves Original Audio**: Keeps background music and sound effects intact.
-- **Improved Synchronization**: Advanced audio processing techniques for better lip-sync and timing.
-- **Performance Monitoring**: Logs processing times and memory usage for different stages.
-- **Web UI & CLI**: Use the simple web interface or run directly from the command line.
+### Core translation pipeline
+- **ASR + alignment**: WhisperX with faster-whisper backend + forced alignment for tighter word timing.
+- **Translation**: NLLB-200 model family with hardware-tiered model selection.
+- **Speech synthesis**: Unified `TTSEngine` routing between:
+  - `melo` — default, good multilingual quality
+  - `qwen3` — **voice cloning**: clones the original speaker's voice into the target language
+  - `gtts` (fallback)
+- **Audio quality controls**:
+  - Demucs vocal/background separation
+  - Rubber Band time-stretch via `pyrubberband`
+  - Segment timing budget + translation compression pass for overflow segments
+  - Crossfades and ducking to reduce artifacts/pops
+- **Final render**: FFmpeg stream-copy video + AAC audio muxing.
 
-## 🎬 Demo: English to French Translation
+### Runtime and platform improvements
+- **GPU-aware optimization** via `gpu_config.py`.
+- **Sequential model lifecycle** to reduce VRAM spikes.
+- **Performance telemetry** via `performance_monitor.py`.
+- **Config-driven behavior** through `config.yaml`.
 
-Here's a sample of the VideoTranslator in action!
+### Interfaces
+- **CLI pipeline execution** through `translator.py`.
+- **API + WebSocket orchestration** through `server.py`.
+- **Web UI** through Next.js app in `video-translator/`.
 
-I translated the first 5 minutes of this video by Fern:
-- **Original Video (English):** [The Hunt for America's Smartest Killer](https://youtu.be/wkVygetgeRY?si=hKF2XqJD3jZU3KIL)
+---
 
-The full 28-minute video wasn't translated as it would take a significant amount of time (likely well over an hour) on Kaggle T4 GPU at 360p resolution. This 5-minute clip demonstrates the translation quality and process.
+## Supported target languages (current map)
 
-- **Translated Output (First 5 mins, French):** [View Translated Sample (translated_fern_eng.mp4)](./translated_fern_eng.mp4)
+`en`, `es`, `fr`, `zh`, `ja`, `ko`, `de`, `pt`
 
-## Installation (⌐■_■)
+See `LANGUAGE_MODEL_MAP` in `translator.py` for active speaker and language mappings.
 
-### Prerequisites
-- **Python 3.11 or later**: This is the recommended and tested version.
-- **CUDA-enabled GPU (Recommended for speed)**: Ensure you have NVIDIA drivers and a CUDA toolkit version compatible with PyTorch.
+---
 
-### Note on MeloTTS
-This project now uses MeloTTS. You'll need to clone its repository and install it. The `setup.py` script attempts to handle this.
+## Repository layout
 
-**NOTE**: If you run into an error while installing fugashi, install mecab: `sudo apt-get install mecab libmecab-dev mecab-ipadic-utf8`
+```text
+videoTranslator/
+├── translator.py           # End-to-end dubbing pipeline
+├── tts_engine.py           # Unified TTS backend (Melo/Qwen3/gTTS)
+├── server.py               # FastAPI upload + WebSocket translation endpoints
+├── run.py                  # Starts backend + frontend together
+├── setup.py                # Bootstrap helper (venv, deps, frontend)
+├── gpu_config.py           # Hardware tier detection / optimizer
+├── performance_monitor.py  # Timing and resource tracking
+├── config.yaml             # Runtime overrides
+├── requirements.txt
+└── video-translator/       # Next.js frontend
+```
 
-### Option 1: The Classic (CLI Lovers)
-1.  **Clone this repository:**
-    ```bash
-    git clone https://github.com/Felixdiamond/videoTranslator.git
-    cd videoTranslator
-    ```
-2.  **Install MeloTTS (if not handled by `requirements.txt` or `setup.py`):**
-    It's recommended to follow the official MeloTTS installation if you encounter issues. The project structure expects MeloTTS to be in a directory named `MeloTTS` at the same level as `videoTranslator` or for the package to be installed in the environment.
-    ```bash
-    # Example:
-    # git clone https://github.com/myshell-ai/MeloTTS.git ../MeloTTS
-    # cd ../MeloTTS
-    # pip install -e .
-    # python -m unidic download
-    # cd ../videoTranslator
-    ```
-    *(The `setup.py` script aims to automate part of this, but manual setup might be needed depending on your environment.)*
+---
 
-3.  **Install dependencies:**
-    It's highly recommended to use a virtual environment.
-    ```bash
-    python -m venv venv
-    # On Windows:
-    # venv\Scripts\activate
-    # On macOS/Linux:
-    # source venv/bin/activate
-    pip install -r requirements.txt
-    ```
+## Prerequisites
 
-### Option 2: The Fancy Setup (Automated)
-1.  **Clone the repository:**
-    ```bash
-    git clone https://github.com/Felixdiamond/videoTranslator.git
-    cd videoTranslator
-    ```
-2.  **Run the setup script:**
-    This script will attempt to create a virtual environment, install backend dependencies (including trying to set up MeloTTS), and set up the frontend.
-    ```bash
-    python setup.py
-    ```
-## Usage (╯°□°）╯︵ ┻━┻
+- Python **3.12**
+- Node.js + npm (for frontend)
+- FFmpeg in `PATH`
+- `rubberband-cli` installed (required by `pyrubberband`)
+- CUDA GPU recommended for speed (CPU works, slower)
+- Melo backend source: `https://github.com/Felixdiamond/MeloTTS` (modified for python 3.12 support)
 
-### If you chose Option 1 (CLI)
-1.  **Activate your virtual environment** (if you created one).
-2.  **Run the script:**
-    ```bash
-    python translator.py <path_to_your_video> <target_language_code>
-    ```
-    Example: `python translator.py my_video.mp4 fr`
-    Supported language codes: `en`, `es`, `fr`, `zh`, `ja`, `ko`, `de`, `pt`.
-3.  Grab a (potentially larger) snack! Processing can take time, especially on CPU. ✨
-4.  Find your translated video in a newly created folder (e.g., `my_video_translated_output/translated_my_video_fr.mp4`). Logs are saved in the `logs` directory.
+Linux helper packages (example):
 
-### If you chose Option 2 (Web UI)
-1.  **Activate your virtual environment:**
-    -   On Windows: `venv\Scripts\activate`
-    -   On macOS/Linux: `source venv/bin/activate`
-2.  **Run the application:**
-    ```bash
-    python run.py
-    ```
-3.  Open `http://localhost:3000` in your browser.
-4.  Upload your video and select the target language.
-5.  Wait for the magic! The UI will indicate when processing is complete and show the output path.
+```bash
+sudo apt-get update
+sudo apt-get install -y ffmpeg rubberband-cli mecab libmecab-dev mecab-ipadic-utf8
+```
 
-## Known Issues & Considerations (;´༎ຶД༎ຶ`)
-- **Resource Intensive**: AI models, especially for video, require significant CPU/GPU and RAM. GPU is highly recommended. **But you don't need something too high end, all tests i've done is with kaggle + T4 GPU**
-- **Time Consuming**: Translation is a multi-step process. Be patient!
-- **MeloTTS Speaker IDs**: The current implementation uses default speaker IDs for MeloTTS. Voice variety might be limited per language.
-- **Error Handling**: While improved, complex pipelines can have various failure points. Check `logs/video_translator.log` for details if issues arise.
-- **Speech sometimes unnaturally fast/slow**
+---
 
-## Future Plans (づ｡◕‿‿◕｡)づ
-- **Fix speech speed**
-- **Voice Cloning/Selection**: Integrate more advanced voice options, potentially voice cloning for the target language.
-- **Subtitle Generation**: Option to generate and embed translated subtitles.
-- **Further Performance Optimization**: Continuously improve speed and resource efficiency.
-- **Expanded Language Support**: Add more languages as high-quality open-source models become available.
-- **UI Enhancements**: More detailed progress, error reporting, and configuration options in the UI.
+## Installation
 
-## Contributing ᕕ( ᐛ )ᕗ
-Ideas? Bugs? Want to add Klingon (MeloTTS might need some training data!)? Contributions are welcome! Open an issue or submit a PR.
+### Option A — automated setup
 
-ありがとう for checking out this VideoTranslator! Let's keep pushing the boundaries of open-source AI! (oﾟvﾟ)ノ
+```bash
+git clone https://github.com/Felixdiamond/videoTranslator.git
+cd videoTranslator
+python setup.py
+```
+
+This installs base Python dependencies, whisperX, MeloTTS (default TTS), and the frontend. TTS selection is opt-in:
+
+| Flag | Effect |
+|------|--------|
+| *(default)* | whisperX + MeloTTS |
+| `--no-melo` | skip MeloTTS (use `gTTS` fallback only) |
+| `--qwen3` | also install Qwen3-TTS (adds **voice cloning**) |
+| `--no-melo --qwen3` | whisperX + Qwen3-TTS only |
+
+Examples:
+
+```bash
+# default — whisperX + MeloTTS
+python setup.py
+
+# MeloTTS + voice cloning
+python setup.py --qwen3
+
+# Qwen3-TTS only (skip MeloTTS)
+python setup.py --no-melo --qwen3
+```
+
+> whisperX is always installed — it is required for ASR alignment.
+
+### Option B — manual setup
+
+```bash
+git clone https://github.com/Felixdiamond/videoTranslator.git
+cd videoTranslator
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+Then install the frontend:
+
+```bash
+cd video-translator && npm install && cd ..
+```
+
+#### whisperX (always required — installed automatically by `setup.py`)
+
+```bash
+git clone https://github.com/m-bain/whisperX.git /tmp/whisperx
+sed -i 's/torch~=2.8.0/torch>=2.8.0/' /tmp/whisperx/pyproject.toml
+sed -i 's/torchaudio~=2.8.0/torchaudio>=2.8.0/' /tmp/whisperx/pyproject.toml
+pip install -e /tmp/whisperx
+```
+
+#### MeloTTS (default TTS engine)
+
+```bash
+git clone https://github.com/Felixdiamond/MeloTTS.git
+pip install --no-build-isolation -e ./MeloTTS
+python -m unidic download
+```
+
+#### Qwen3-TTS (optional — required for voice cloning)
+
+Install this if you want the pipeline to clone the original speaker's voice into the target language.
+
+```bash
+git clone https://github.com/QwenLM/Qwen3-TTS.git /tmp/qwen3tts
+sed -i 's/transformers==4.57.3/transformers>=4.47.1/' /tmp/qwen3tts/pyproject.toml
+pip install -e /tmp/qwen3tts
+```
+
+Then in `config.yaml`:
+
+```yaml
+tts_mode: qwen3
+enable_voice_cloning: true
+```
+
+Without Qwen3-TTS the pipeline stays on `melo` or `gtts` and voice cloning is unavailable.
+
+---
+
+## Kaggle (recommended for new users)
+
+Use **only** `videotranslator.ipynb` in this repository. Other older Kaggle notebooks/scripts are considered outdated.
+
+Kaggle session settings:
+- `accelerator: T4 x 2`
+- `environment: Always use latest`
+
+Minimal Kaggle run flow:
+1. Open `videotranslator.ipynb` in Kaggle.
+2. Run cells in order.
+3. Keep TTS mode on `melo`.
+4. Run translation cell with your input video path and target language.
+
+The notebook includes Kaggle-specific setup quirks handling (dependency pin relaxations and install order) to reduce environment breakage on latest images.
+
+---
+
+## Run modes
+
+### 1) Full app (backend + frontend)
+
+```bash
+source venv/bin/activate
+python run.py
+```
+
+- Frontend: `http://localhost:3000`
+- Backend: `http://localhost:8000`
+
+### 2) Backend only
+
+```bash
+source venv/bin/activate
+python server.py
+```
+
+### 3) CLI only
+
+```bash
+source venv/bin/activate
+python translator.py <video_path> <target_language_code>
+```
+
+Example:
+
+```bash
+python translator.py ./sample.mp4 fr
+```
+
+Outputs are created in `*_translated_output/` directories.
+
+---
+
+## Configuration (`config.yaml`)
+
+`translator.py` loads `config.yaml` at startup and applies overrides for model/runtime selection.
+
+Useful keys:
+- `hardware_tier`: `auto | cpu_low | cpu_high | gpu_low | gpu_medium | gpu_high`
+- `whisper_model`
+- `translation_model`
+- `tts_mode`: `melo | qwen3 | gtts`
+- `qwen3_model_size`: `0.6B | 1.7B`
+- `enable_voice_cloning`: `true | false`
+- `melo_speaker_id`
+- `demucs_model`
+
+If you want Qwen3 voice cloning by default, set:
+
+```yaml
+tts_mode: qwen3
+enable_voice_cloning: true
+qwen3_model_size: "1.7B"
+```
+
+---
+
+## API surface (current)
+
+### Upload endpoint
+- `POST /upload`
+- Receives a file and stores it in `uploaded_files/`
+
+### Translation WebSocket
+- `WS /translate/{video_path}/{target_language}`
+- Query params:
+  - `tts_mode` (default `melo`)
+  - `speaker_id` (Melo speaker)
+  - `enable_voice_cloning` (bool)
+
+Frontend currently uses the default WebSocket parameters unless customized.
+
+---
+
+## Troubleshooting
+
+- **`ffmpeg` not found**: install FFmpeg and ensure it is in `PATH`.
+- **`pyrubberband` errors**: install `rubberband-cli`.
+- **MeloTTS import/setup issues**: install `Felixdiamond/MeloTTS` manually and confirm environment activation.
+- **Qwen3 unavailable**: install `qwen-tts` or source package; fallback to `melo`/`gtts`.
+- **OOM on GPU**: lower `hardware_tier`, switch `tts_mode`, or reduce workload length.
+
+Logs are written to `logs/video_translator.log`.
+
+---
+
+## Status and next focus
+
+Major quality/stability milestones from the implementation plan are completed (ASR alignment, Demucs mixing, NLLB migration, config-driven model control, FFmpeg final mux).
+
+Remaining focus is mostly validation and iterative quality tuning (long-form tests, edge-case handling, voice naturalness).
+
+---
+
+## Contributing
+
+Issues and PRs are welcome. If you propose a quality/performance change, include:
+- a short reproducible test clip
+- hardware info (CPU/GPU + VRAM)
+- before/after observations (timing, quality, artifacts)
