@@ -1580,11 +1580,11 @@ def process_video(
                 ) as tts_engine:
                     with performance_monitor.timer("tts_model_loading"):
                         if tts_mode == "qwen3":
-                            tts_engine.load_qwen3()
+                            tts_engine.load_qwen3(for_voice_cloning=enable_voice_cloning)
                             if tts_engine._qwen is None:
                                 raise RuntimeError(
                                     "Qwen3-TTS is not installed. "
-                                    "Install it with: pip install git+https://github.com/QwenLM/Qwen3-TTS.git"
+                                    "Install it with: pip install -U qwen-tts"
                                 )
                             if enable_voice_cloning:
                                 demucs_vocals_path = os.path.join(

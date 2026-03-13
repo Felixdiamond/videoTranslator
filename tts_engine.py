@@ -42,12 +42,19 @@ except ImportError:
     logging.warning("tts_engine: MeloTTS not installed — MeloTTS mode disabled.")
 
 try:
-    from qwen3_tts import Qwen3TTSModel          # pip install git+https://github.com/QwenLM/Qwen3-TTS.git
+    from qwen_tts import Qwen3TTSModel  # pip install -U qwen-tts
     _QWEN3_AVAILABLE = True
 except ImportError:
-    Qwen3TTSModel = None
-    _QWEN3_AVAILABLE = False
-    logging.warning("tts_engine: Qwen3-TTS not installed — Qwen3 mode disabled.")
+    try:
+        from qwen3_tts import Qwen3TTSModel  # legacy source install path
+        _QWEN3_AVAILABLE = True
+    except ImportError:
+        Qwen3TTSModel = None
+        _QWEN3_AVAILABLE = False
+        logging.warning(
+            "tts_engine: Qwen3-TTS not installed — install with `pip install -U qwen-tts` "
+            "(or source install from QwenLM/Qwen3-TTS)."
+        )
 
 try:
     import soundfile as sf
@@ -127,6 +134,7 @@ class TTSEngine:
         self._melo = None
         self._current_melo_lang: Optional[str] = None
         self._qwen = None
+        self._qwen_variant: Optional[str] = None  # "Base" | "CustomVoice"
         self._reference_embedding = None   # pre-computed voice-clone embedding
 
     # ------------------------------------------------------------------
@@ -159,12 +167,18 @@ class TTSEngine:
             f"TTSEngine: MeloTTS ready. Speakers: {list(self._melo.hps.data.spk2id.keys())}"
         )
 
-    def load_qwen3(self) -> None:
-        """Load Qwen3-TTS from HuggingFace Hub."""
+    def load_qwen3(self, for_voice_cloning: bool = False) -> None:
+        """Load Qwen3-TTS from HuggingFace Hub.
+
+        Args:
+            for_voice_cloning: When ``True``, load the ``Base`` checkpoint
+                required for high-fidelity cloning. Otherwise load ``CustomVoice``.
+        """
         if not _QWEN3_AVAILABLE:
             logging.warning("TTSEngine: Qwen3-TTS unavailable — skipping load.")
             return
-        model_id = f"Qwen/Qwen3-TTS-12Hz-{self.model_size}-CustomVoice"
+        variant = "Base" if for_voice_cloning else "CustomVoice"
+        model_id = f"Qwen/Qwen3-TTS-12Hz-{self.model_size}-{variant}"
         device_str = str(self.device)
         if device_str.startswith("cuda"):
             bf16_supported = bool(
@@ -183,6 +197,7 @@ class TTSEngine:
             device_map=device_str,
             dtype=dtype,
         )
+        self._qwen_variant = variant
         logging.info("TTSEngine: Qwen3-TTS ready.")
 
     # ------------------------------------------------------------------
@@ -191,7 +206,7 @@ class TTSEngine:
 
     def extract_voice_embedding(
         self, reference_audio_path: str, reference_text: str = ""
-    ) -> None:
+    ) -> bool:
         """Pre-compute a speaker embedding from a 3–10 s reference clip.
 
         The embedding is cached in ``self._reference_embedding`` and reused
@@ -259,7 +274,7 @@ class TTSEngine:
             if self._qwen is None:
                 raise RuntimeError(
                     "TTSEngine: Qwen3-TTS is not loaded. "
-                    "Install it with: pip install git+https://github.com/QwenLM/Qwen3-TTS.git"
+                    "Install it with: pip install -U qwen-tts"
                 )
             self._synthesize_qwen3(text, language_code, output_path, speaker_id, instruct)
         elif self.mode == "melo" and self._melo is not None:
@@ -271,6 +286,24 @@ class TTSEngine:
     # Backend helpers (private)
     # ------------------------------------------------------------------
 
+    def _normalize_qwen_language(self, language_code: str) -> str:
+        """Map short ISO-like language code to Qwen expected language names."""
+        lang_map = {
+            "en": "English",
+            "zh": "Chinese",
+            "ja": "Japanese",
+            "ko": "Korean",
+            "de": "German",
+            "fr": "French",
+            "ru": "Russian",
+            "pt": "Portuguese",
+            "es": "Spanish",
+            "it": "Italian",
+        }
+        if not language_code:
+            return "Auto"
+        return lang_map.get(language_code.lower(), "Auto")
+
     def _synthesize_qwen3(
         self,
         text: str,
@@ -279,7 +312,8 @@ class TTSEngine:
         speaker_id: Optional[str],
         instruct: str,
     ) -> None:
-        kwargs = dict(text=[text], language=[language_code.capitalize()])
+        qwen_language = self._normalize_qwen_language(language_code)
+        kwargs = dict(text=text, language=qwen_language)
         try:
             if self._reference_embedding is not None:
                 wavs, sr = self._qwen.generate_voice_clone(
@@ -287,10 +321,15 @@ class TTSEngine:
                     **kwargs,
                 )
             else:
+                if self._qwen_variant == "Base":
+                    raise RuntimeError(
+                        "Qwen Base model loaded but no voice clone prompt is available. "
+                        "Enable/repair reference extraction or disable voice cloning."
+                    )
                 spk = speaker_id or "Ryan"
                 wavs, sr = self._qwen.generate_custom_voice(
-                    speaker=[spk],
-                    instruct=[instruct],
+                    speaker=spk,
+                    instruct=instruct,
                     **kwargs,
                 )
             if _SF_AVAILABLE:
@@ -364,6 +403,7 @@ class TTSEngine:
         if self._qwen is not None:
             del self._qwen
             self._qwen = None
+        self._qwen_variant = None
         self._reference_embedding = None
         self._current_melo_lang = None
         torch.cuda.empty_cache()
