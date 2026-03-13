@@ -165,11 +165,22 @@ class TTSEngine:
             logging.warning("TTSEngine: Qwen3-TTS unavailable — skipping load.")
             return
         model_id = f"Qwen/Qwen3-TTS-12Hz-{self.model_size}-CustomVoice"
-        dtype = torch.bfloat16 if self.device == "cuda" else torch.float32
-        logging.info(f"TTSEngine: loading Qwen3-TTS '{model_id}'")
+        device_str = str(self.device)
+        if device_str.startswith("cuda"):
+            bf16_supported = bool(
+                torch.cuda.is_available()
+                and hasattr(torch.cuda, "is_bf16_supported")
+                and torch.cuda.is_bf16_supported()
+            )
+            dtype = torch.bfloat16 if bf16_supported else torch.float16
+        else:
+            dtype = torch.float32
+        logging.info(
+            f"TTSEngine: loading Qwen3-TTS '{model_id}' on device='{device_str}' with dtype='{dtype}'"
+        )
         self._qwen = Qwen3TTSModel.from_pretrained(
             model_id,
-            device_map=self.device,
+            device_map=device_str,
             dtype=dtype,
         )
         logging.info("TTSEngine: Qwen3-TTS ready.")
