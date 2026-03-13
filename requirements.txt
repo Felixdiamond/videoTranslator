@@ -1,61 +1,43 @@
-# Core ML/AI Libraries
-# ── torch triplet must be installed together at matching versions ──────────────
-# For CUDA 12.1 (Kaggle T4/P100, most cloud GPUs as of 2026):
-#   pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
-#       --index-url https://download.pytorch.org/whl/cu121
-# For CUDA 11.8:
-#   pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
-#       --index-url https://download.pytorch.org/whl/cu118
-# CPU-only fallback:
-#   pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1
-#
-# DO NOT let pip upgrade torchvision/torchaudio independently — a mismatch
-# between torch and torchvision causes "operator torchvision::nms does not
-# exist" at runtime (torchvision C-extension ABI incompatibility).
-torch==2.5.1
-torchvision==0.20.1
-torchaudio==2.5.1
-transformers>=4.40.0  # For NLLB-200 translation (NllbTokenizer, AutoModelForSeq2SeqLM)
-accelerate # For GPU optimization and mixed precision
-# openai-whisper replaced by faster-whisper + whisperx
+# ── torch triplet ─────────────────────────────────────────────────────────────
+# Install all three together from the same index URL to avoid ABI mismatches.
+# CUDA 12.1:  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# CUDA 11.8:  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+# CPU-only:   pip install torch torchvision torchaudio
+# Kaggle:     do NOT install these — see kaggle_run.ipynb Cell 2.
+torch
+torchvision
+torchaudio
+
+# ML / Transcription
+transformers>=4.40.0
+accelerate
 faster-whisper>=1.2.1
 whisperx>=3.1.0
 
-# Audio Processing
+# Audio
 librosa
 soundfile
 pydub
-noisereduce # For noise reduction
-pyrubberband>=0.3.0  # High-quality time-stretch (requires: sudo apt-get install rubberband-cli)
-demucs>=4.0.1       # Source separation for SFX preservation (Issue 2)
+noisereduce
+pyrubberband>=0.3.0  # requires: apt-get install rubberband-cli
+demucs>=4.0.1
 
-# Text-to-Speech
-gtts # Google Text-to-Speech (fallback)
-# MeloTTS is installed separately, see README.md for instructions.
-# unidic is also installed separately for Japanese support in MeloTTS.
-# Qwen3-TTS (voice cloning, 10 languages) — install manually:
-#   pip install git+https://github.com/QwenLM/Qwen3-TTS.git
-#   Optional GPU acceleration: pip install flash-attn
-# Model weights are downloaded automatically on first use:
-#   Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice  (2 GB VRAM, fast)
-#   Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice  (4–5 GB VRAM, quality)
+# TTS
+gtts
+# MeloTTS: pip install git+https://github.com/Felixdiamond/MeloTTS.git
+# Qwen3-TTS: pip install git+https://github.com/QwenLM/Qwen3-TTS.git
 
-# Video Processing
+# Video
 moviepy
 
-# Web Server & API
+# Web server
 fastapi
-uvicorn[standard] # Includes websockets and other standard dependencies
-# websockets # Now included with uvicorn[standard]
+uvicorn[standard]
 
 # Utilities
-tqdm # Progress bars
-psutil # For system performance monitoring
-pyyaml # For config.yaml loading (config overrides)
-sentencepiece # Dependency for some Hugging Face tokenizers
-sacremoses # Dependency for some Hugging Face tokenizers
+tqdm
+psutil
+pyyaml
+sentencepiece
+sacremoses
 numpy
-
-# Note: TTS (from Coqui TTS) was previously listed but the new script uses MeloTTS or gTTS.
-# If Coqui TTS is still desired as an option, it would need to be re-added.
-# The new script does not import from 'TTS.utils' anymore.
