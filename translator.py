@@ -365,44 +365,95 @@ def extract_voice_reference(
     audio_path: str,
     transcript: dict,
     project_dir: str,
-) -> Optional[str]:
+    fallback_audio_path: Optional[str] = None,
+
+) -> Optional[Dict[str, object]]:
     """Extract a clean 4–10 s speech segment from the source audio for voice cloning.
 
     Scans transcript segments for a clip with duration 4–10 s and RMS above
-    -30 dBFS (i.e. clearly audible speech, not background noise).  Exports the
+    -30 dBFS (i.e. clearly audible speech, not background noise). Prefers
+    segments with usable transcript text and durations near 7 s. Exports the
     chosen clip as ``<project_dir>/audio/voice_reference.wav``.
 
     Args:
-        audio_path: Path to the full extracted audio WAV.
+        audio_path: Preferred audio source for reference extraction.
         transcript: WhisperX transcript dict with a ``"segments"`` list.
         project_dir: Root project directory (``audio/`` sub-folder must exist).
+        fallback_audio_path: Optional secondary audio source to try if the
+            preferred one yields no usable reference segment.
 
     Returns:
-        Path to the exported reference clip, or ``None`` if no suitable segment
-        was found (pipeline will proceed without voice cloning).
+        Metadata for the exported reference clip, including the clip path and
+        matched transcript text, or ``None`` if no suitable segment was found
+        (pipeline will proceed without voice cloning).
     """
     ref_path = os.path.join(project_dir, "audio", "voice_reference.wav")
     segments = transcript.get("segments", [])
 
-    try:
-        audio = AudioSegment.from_file(audio_path)
-    except Exception as e:
-        logging.warning(f"extract_voice_reference: could not load audio: {e}")
-        return None
+    candidate_audio_paths = []
+    for path in (audio_path, fallback_audio_path):
+        if path and path not in candidate_audio_paths and os.path.exists(path):
+            candidate_audio_paths.append(path)
 
-    for seg in segments:
-        dur = seg["end"] - seg["start"]
-        if 4.0 <= dur <= 10.0:
-            start_ms = int(seg["start"] * 1000)
-            end_ms = int(seg["end"] * 1000)
+    for candidate_audio_path in candidate_audio_paths:
+        try:
+            audio = AudioSegment.from_file(candidate_audio_path)
+        except Exception as e:
+            logging.warning(
+                f"extract_voice_reference: could not load audio '{candidate_audio_path}': {e}"
+            )
+            continue
+
+        best_candidate = None
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+
+            start = seg.get("start")
+            end = seg.get("end")
+            if start is None or end is None:
+                continue
+
+            dur = end - start
+            if not (4.0 <= dur <= 10.0):
+                continue
+
+            start_ms = int(start * 1000)
+            end_ms = int(end * 1000)
             clip = audio[start_ms:end_ms]
-            if clip.dBFS > -30:
-                clip.export(ref_path, format="wav")
-                logging.info(
-                    f"extract_voice_reference: exported {seg['start']:.1f}s–{seg['end']:.1f}s "
-                    f"({dur:.1f}s, {clip.dBFS:.1f} dBFS) → {ref_path}"
-                )
-                return ref_path
+            if clip.dBFS <= -30:
+                continue
+
+            text = (seg.get("text") or "").strip()
+            text_bonus = 10.0 if text else 0.0
+            duration_penalty = abs(dur - 7.0)
+            score = clip.dBFS + text_bonus - duration_penalty
+            candidate = {
+                "path": ref_path,
+                "text": text,
+                "start": start,
+                "end": end,
+                "duration": dur,
+                "dbfs": clip.dBFS,
+                "clip": clip,
+                "score": score,
+                "source_audio": candidate_audio_path,
+            }
+            if best_candidate is None or candidate["score"] > best_candidate["score"]:
+                best_candidate = candidate
+
+        if best_candidate:
+            best_candidate["clip"].export(ref_path, format="wav")
+            logging.info(
+                "extract_voice_reference: exported "
+                f"{best_candidate['start']:.1f}s–{best_candidate['end']:.1f}s "
+                f"({best_candidate['duration']:.1f}s, {best_candidate['dbfs']:.1f} dBFS) "
+                f"from='{best_candidate['source_audio']}' "
+                f"text='{str(best_candidate['text'])[:80]}' → {ref_path}"
+            )
+            best_candidate.pop("clip", None)
+            best_candidate.pop("score", None)
+            return best_candidate
 
     logging.warning(
         "extract_voice_reference: no suitable segment found (need 4–10 s, dBFS > -30). "
@@ -1531,14 +1582,18 @@ def process_video(
                         if tts_mode == "qwen3":
                             tts_engine.load_qwen3()
                             if enable_voice_cloning:
-                                ref_audio = extract_voice_reference(
-                                    extracted_audio_path, transcript_data, project_dir
+                                demucs_vocals_path = os.path.join(
+                                    project_dir, "audio", "demucs_vocals.wav"
                                 )
-                                if ref_audio:
-                                    ref_text = (
-                                        transcript_data["segments"][0]["text"]
-                                        if transcript_data.get("segments") else ""
-                                    )
+                                ref_sample = extract_voice_reference(
+                                    demucs_vocals_path,
+                                    transcript_data,
+                                    project_dir,
+                                    fallback_audio_path=extracted_audio_path,
+                                )
+                                if ref_sample:
+                                    ref_audio = str(ref_sample["path"])
+                                    ref_text = str(ref_sample.get("text") or "")
                                     tts_engine.extract_voice_embedding(ref_audio, ref_text)
                         else:  # "melo" (default) or unrecognised mode
                             melo_lang = LANGUAGE_MODEL_MAP.get(
