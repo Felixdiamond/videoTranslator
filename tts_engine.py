@@ -201,13 +201,17 @@ class TTSEngine:
             reference_audio_path: Path to a clean WAV clip of the speaker.
             reference_text: Transcript of the reference clip (improves accuracy).
 
-        Raises:
-            RuntimeError: If Qwen3-TTS is not yet loaded.
+        Returns:
+            ``True`` if the embedding was extracted, ``False`` if Qwen3-TTS is
+            not loaded (e.g. the package is not installed) — pipeline continues
+            without voice cloning in that case.
         """
         if self._qwen is None:
-            raise RuntimeError(
-                "TTSEngine: Qwen3-TTS not loaded — call load_qwen3() first."
+            logging.warning(
+                "TTSEngine: skipping voice-clone embedding — "
+                "Qwen3-TTS not loaded (package missing or load failed)."
             )
+            return False
         logging.info(
             f"TTSEngine: extracting voice embedding from '{reference_audio_path}'"
         )
@@ -217,6 +221,7 @@ class TTSEngine:
             x_vector_only_mode=False,   # full prompt embedding for best quality
         )
         logging.info("TTSEngine: voice-clone embedding cached.")
+        return True
 
     # ------------------------------------------------------------------
     # Synthesis (unified interface)
@@ -234,12 +239,12 @@ class TTSEngine:
         """Synthesise *text* and write audio to *output_path*.
 
         Routing logic:
-        - ``mode='qwen3'`` with loaded model → voice-clone (if embedding cached)
-          or preset speaker.
-        - ``mode='melo'`` with loaded model → MeloTTS using *speaker_id*
+        - ``mode='qwen3'`` → Qwen3-TTS (voice-clone if embedding cached, preset otherwise).
+          Raises ``RuntimeError`` if the model is not loaded.
+        - ``mode='melo'`` with loaded model → MeloTTS using *speaker_id``
           (auto-selects from config if *speaker_id* is ``None``).
-        - ``mode='gtts'`` or no model loaded → gTTS network fallback.
-        - Any backend failure → gTTS fallback.
+        - ``mode='gtts'`` → gTTS directly.
+        - MeloTTS failure → gTTS fallback.
 
         Args:
             text: Text to synthesise.
@@ -250,7 +255,12 @@ class TTSEngine:
             instruct: Natural-language style instruction for Qwen3-TTS
                       (e.g. ``"speak excitedly"``).
         """
-        if self.mode == "qwen3" and self._qwen is not None:
+        if self.mode == "qwen3":
+            if self._qwen is None:
+                raise RuntimeError(
+                    "TTSEngine: Qwen3-TTS is not loaded. "
+                    "Install it with: pip install git+https://github.com/QwenLM/Qwen3-TTS.git"
+                )
             self._synthesize_qwen3(text, language_code, output_path, speaker_id, instruct)
         elif self.mode == "melo" and self._melo is not None:
             self._synthesize_melo(text, language_code, output_path, speed, speaker_id)
@@ -289,11 +299,8 @@ class TTSEngine:
                 import scipy.io.wavfile as wavfile
                 wavfile.write(output_path, sr, wavs[0])
         except Exception as e:
-            logging.error(
-                f"TTSEngine: Qwen3 synthesis failed: {e}. Falling back to gTTS.",
-                exc_info=True,
-            )
-            self._synthesize_gtts(text, language_code, output_path)
+            logging.error(f"TTSEngine: Qwen3 synthesis failed: {e}", exc_info=True)
+            raise
 
     def _synthesize_melo(
         self,
