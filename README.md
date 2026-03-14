@@ -128,26 +128,16 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Then install the frontend:
+Then install the frontend (optional if CLI or Server only):
 
 ```bash
 cd video-translator && npm install && cd ..
 ```
 
-#### whisperX (always required — installed automatically by `setup.py`)
-
-```bash
-git clone https://github.com/m-bain/whisperX.git /tmp/whisperx
-sed -i 's/torch~=2.8.0/torch>=2.8.0/' /tmp/whisperx/pyproject.toml
-sed -i 's/torchaudio~=2.8.0/torchaudio>=2.8.0/' /tmp/whisperx/pyproject.toml
-pip install -e /tmp/whisperx
-```
-
 #### MeloTTS (default TTS engine)
 
 ```bash
-git clone https://github.com/Felixdiamond/MeloTTS.git
-pip install --no-build-isolation -e ./MeloTTS
+pip install git+https://github.com/Felixdiamond/MeloTTS.git
 python -m unidic download
 ```
 

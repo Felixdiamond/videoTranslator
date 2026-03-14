@@ -16,7 +16,7 @@ import pyrubberband as pyrb
 import torchaudio
 from demucs.pretrained import get_model as demucs_get_model
 from demucs.apply import apply_model as demucs_apply_model
-from moviepy.editor import VideoFileClip, AudioFileClip
+from moviepy import VideoFileClip, AudioFileClip
 # CompositeAudioClip might not be directly used if pydub handles all composition
 from gtts import gTTS
 from pydub import AudioSegment, effects as pydub_effects # Renamed to avoid conflict

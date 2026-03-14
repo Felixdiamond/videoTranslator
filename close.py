@@ -9,7 +9,7 @@ import numpy as np
 import concurrent.futures
 
 import whisper
-from moviepy.editor import VideoFileClip, AudioFileClip, CompositeAudioClip
+from moviepy import VideoFileClip, AudioFileClip, CompositeAudioClip
 from gtts import gTTS
 from pydub import AudioSegment
 from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
