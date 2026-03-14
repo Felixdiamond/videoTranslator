@@ -48,6 +48,19 @@ See `LANGUAGE_MODEL_MAP` in `translator.py` for active speaker and language mapp
 
 ---
 
+## 🎬 Demo: English to French Translation
+
+Here's a sample of the VideoTranslator in action!
+
+I translated the first 5 minutes of this video by Fern:
+- **Original Video (English):** [The Hunt for America's Smartest Killer](https://youtu.be/wkVygetgeRY?si=hKF2XqJD3jZU3KIL)
+
+The full 28-minute video wasn't translated as it would take a significant amount of time (likely well over an hour) on Kaggle T4 GPU at 360p resolution. This 5-minute clip demonstrates the translation quality and process.
+
+- **Translated Output (First 5 mins, French):** [View Translated Sample (translated_fern_eng.mp4)](./translated_fern_eng.mp4)
+
+---
+
 ## Repository layout
 
 ```text
