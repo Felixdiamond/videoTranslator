@@ -79,7 +79,7 @@ Linux helper packages (example):
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y ffmpeg rubberband-cli mecab libmecab-dev mecab-ipadic-utf8
+sudo apt-get install -y ffmpeg rubberband-cli mecab libmecab-dev mecab-ipadic-utf8 libavcodec-extra
 ```
 
 ---

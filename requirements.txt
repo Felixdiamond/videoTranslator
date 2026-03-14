@@ -41,3 +41,4 @@ pyyaml
 sentencepiece
 sacremoses
 numpy
+setuptools<=81
