@@ -6,6 +6,7 @@ import tempfile
 import math
 import shutil
 import mmap
+import re
 from typing import List, Tuple, Dict, Optional
 import numpy as np
 import concurrent.futures
@@ -109,6 +110,7 @@ LANGUAGE_MODEL_MAP: Dict[str, Dict[str, str]] = {
 DUCKING_GAIN_DB = -18  # How much to reduce original audio volume during translated speech
 CROSSFADE_MS = 50     # Crossfade duration for audio segments
 BOUNDARY_FADE_MS = 12  # Phase 4 / Issue 12: fade ms at silence cut-points to kill pops
+MIN_SEGMENT_MS = 800
 
 # --- Phase 1a: Hardware-tiered Whisper model sizes ---
 WHISPER_MODEL_TIERS: Dict[str, str] = {
@@ -608,6 +610,121 @@ def analyze_segment_timing_budget(
     return results
 
 
+def merge_short_segments(segments: List[dict], min_ms: int = MIN_SEGMENT_MS) -> List[dict]:
+    """Merge very short consecutive segments into a neighbor before translation/TTS."""
+    if not segments:
+        return segments
+
+    merged: List[dict] = []
+    i = 0
+    while i < len(segments):
+        seg = segments[i]
+        seg_start = float(seg.get("start", 0.0) or 0.0)
+        seg_end = float(seg.get("end", seg_start) or seg_start)
+        duration_ms = int(max(0.0, seg_end - seg_start) * 1000)
+
+        if duration_ms < min_ms and i + 1 < len(segments):
+            next_seg = segments[i + 1]
+            next_start = float(next_seg.get("start", seg_end) or seg_end)
+            next_end = float(next_seg.get("end", next_start) or next_start)
+            combined_text = " ".join(
+                part for part in [str(seg.get("text", "")).strip(), str(next_seg.get("text", "")).strip()] if part
+            )
+            combined = {
+                **next_seg,
+                "start": min(seg_start, next_start),
+                "end": max(seg_end, next_end),
+                "text": combined_text,
+            }
+            merged.append(combined)
+            logging.info(
+                f"[merge_short_segments] merged seg {i} ({duration_ms}ms) + seg {i+1} "
+                f"({int(max(0.0, next_end - next_start) * 1000)}ms) -> "
+                f"{int(max(0.0, combined['end'] - combined['start']) * 1000)}ms"
+            )
+            i += 2
+        else:
+            merged.append(seg)
+            i += 1
+
+    return merged
+
+
+def split_translation_at_clauses(text: str) -> List[str]:
+    """Split translated text at natural clause boundaries for pause-aware synthesis."""
+    clauses = re.split(r'(?<=[.!?,;—])\s+', text.strip())
+    return [c.strip() for c in clauses if c and c.strip()]
+
+
+def synthesise_with_pauses(
+    text: str,
+    available_ms: int,
+    target_language_code: str,
+    tts_engine: Optional["TTSEngine"],
+    speed: float,
+    speaker_id: Optional[str],
+    segment_index: int,
+) -> AudioSegment:
+    """Synthesize clause-by-clause and interleave silence to reduce overflow pressure."""
+    clauses = split_translation_at_clauses(text)
+    if len(clauses) <= 1:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            out_path = tmp.name
+        try:
+            text_to_speech(
+                text,
+                target_language_code,
+                out_path,
+                tts_engine=tts_engine,
+                speed=speed,
+                speaker_id=speaker_id,
+            )
+            return AudioSegment.from_file(out_path)
+        finally:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+
+    clause_audio: List[AudioSegment] = []
+    total_speech_ms = 0
+    temp_paths: List[str] = []
+    try:
+        for clause in clauses:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                clause_path = tmp.name
+            temp_paths.append(clause_path)
+            text_to_speech(
+                clause,
+                target_language_code,
+                clause_path,
+                tts_engine=tts_engine,
+                speed=speed,
+                speaker_id=speaker_id,
+            )
+            audio = AudioSegment.from_file(clause_path)
+            clause_audio.append(audio)
+            total_speech_ms += len(audio)
+
+        gap_count = max(0, len(clauses) - 1)
+        remaining_ms = max(0, available_ms - total_speech_ms)
+        gap_ms = min(400, (remaining_ms // gap_count) if gap_count > 0 else 0)
+
+        result = clause_audio[0]
+        for audio in clause_audio[1:]:
+            if gap_ms > 0:
+                result += AudioSegment.silent(duration=gap_ms, frame_rate=audio.frame_rate)
+            result += audio
+
+        logging.info(
+            f"[prosodic_pause] seg {segment_index}: {len(clauses)} clauses, "
+            f"speech={total_speech_ms}ms, gaps={gap_ms}ms x {gap_count}, total={len(result)}ms"
+        )
+        return result
+    finally:
+        for path in temp_paths:
+            if os.path.exists(path):
+                os.remove(path)
+
+
 def load_translation_model(tier: str) -> Tuple:
     """Load the NLLB-200 translation model and tokenizer for the given hardware tier ([PLAN_h.md L762–L770](PLAN_h.md)).
 
@@ -775,7 +892,7 @@ def advanced_time_stretch_v2(audio: AudioSegment, target_duration_ms: int) -> Au
     current_duration_ms = len(audio)
     rate = current_duration_ms / target_duration_ms  # >1 = speed up, <1 = slow down
 
-    RATE_MIN, RATE_MAX = 0.55, 1.80
+    RATE_MIN, RATE_MAX = 0.65, 1.50
     if rate < RATE_MIN or rate > RATE_MAX:
         logging.warning(
             f"Time stretch rate {rate:.2f} outside natural range [{RATE_MIN}, {RATE_MAX}]. "
@@ -846,53 +963,43 @@ def estimate_ideal_tts_speed(
 def fit_tts_to_slot(
     tts_audio: AudioSegment,
     available_ms: int,
-    next_gap_ms: int,
     segment_index: int,
-) -> Tuple[AudioSegment, int]:
-    """4-strategy cascade to fit TTS into its time slot.
-
-    Returns ``(fitted_audio, actual_duration_used_ms)``.
-
-    Strategy order:
-      1. Rate ≤ 1.3 → gentle pyrubberband stretch to fit.
-      2. Rate 1.3–1.8 → pyrubberband at max comfortable rate.
-      3. Rate > 1.8, next gap exists → borrow up to 50 % of next gap.
-      4. Last resort → hard compress to slot + 200ms fade-out.
-    ([PLAN_h.md L434–L461](PLAN_h.md) — Issue 3, Part 3)
-    """
+) -> AudioSegment:
+    """Fit synthesized speech to a segment slot with naturalness-first rules."""
     tts_ms = len(tts_audio)
     if available_ms <= 0:
-        return tts_audio, tts_ms
+        return tts_audio
 
-    rate = tts_ms / available_ms
+    ratio = tts_ms / available_ms
 
-    # Strategies 1 & 2: pyrubberband stretch (rate clamped inside to [0.55, 1.80])
-    if rate <= 1.8:
-        return advanced_time_stretch_v2(tts_audio, available_ms), available_ms
+    if 0.90 <= ratio <= 1.10:
+        logging.info(f"[fit_tts_to_slot] seg {segment_index}: natural fit ({ratio:.2f}), no adjustment")
+        return tts_audio
 
-    # Strategy 3: borrow time from the following inter-segment gap
-    max_borrowable = int(next_gap_ms * 0.5)
-    if max_borrowable > 0:
-        extended_slot = available_ms + max_borrowable
-        extended_rate = tts_ms / extended_slot
-        if extended_rate <= 1.8:
-            stretched = advanced_time_stretch_v2(tts_audio, extended_slot)
-            logging.info(
-                f"[fit_tts_to_slot] seg {segment_index}: borrowed {max_borrowable}ms "
-                f"from next gap (rate {rate:.2f} → {extended_rate:.2f})"
+    if ratio > 1.10:
+        stretch_ratio = tts_ms / available_ms
+        if stretch_ratio > 1.50:
+            safe_target_ms = int(tts_ms / 1.50)
+            stretched = advanced_time_stretch_v2(tts_audio, safe_target_ms)
+            trimmed = stretched[:available_ms]
+            logging.warning(
+                f"[fit_tts_to_slot] seg {segment_index}: overflow capped at 1.50x, "
+                f"trimmed {len(stretched)}ms -> {available_ms}ms"
             )
-            return stretched, extended_slot
+            return trimmed
 
-    # Strategy 4: hard compress + 200ms fade-out to soften the cut
-    compressed = advanced_time_stretch_v2(tts_audio, available_ms)
-    fade_out_ms = min(200, max(0, len(compressed) // 4))
-    if fade_out_ms > 0:
-        compressed = compressed.fade_out(fade_out_ms)
-    logging.warning(
-        f"[fit_tts_to_slot] seg {segment_index}: rate={rate:.2f} — "
-        f"hard-compressed to {available_ms}ms with {fade_out_ms}ms fade-out"
-    )
-    return compressed, available_ms
+        return advanced_time_stretch_v2(tts_audio, available_ms)
+
+    if ratio < 0.75:
+        silence_ms = max(0, available_ms - tts_ms)
+        padded = tts_audio + AudioSegment.silent(duration=silence_ms, frame_rate=tts_audio.frame_rate)
+        logging.info(
+            f"[fit_tts_to_slot] seg {segment_index}: underflow — padding {silence_ms}ms silence "
+            f"(ratio={ratio:.2f})"
+        )
+        return padded
+
+    return advanced_time_stretch_v2(tts_audio, available_ms)
 
 
 # --- Segment Processing and Synchronization ---
@@ -902,17 +1009,12 @@ def process_segment(
     segments_dir: str,
     tts_engine: Optional["TTSEngine"],
     speaker_id: Optional[str] = None,
-    next_gap_ms: int = 0,
 ):
     """Synthesise and time-stretch one pre-translated segment.
 
     The segment dict is expected to have a ``'translated_text'`` key injected
     by ``batch_translate_segments`` before this function is called.
 
-    Args:
-        next_gap_ms: Silence in ms between this segment's end and the next
-                     segment's start — used by ``fit_tts_to_slot`` to borrow
-                     time when the TTS is too long for its slot.
     """
     i, segment = segment_info
     start_time_ms = int(segment['start'] * 1000)
@@ -943,13 +1045,27 @@ def process_segment(
         start_time_ms = max(0, int(word_starts[0] * 1000) - 30)  # 30ms pre-roll pad
 
     try:
-        text_to_speech(translated_text, target_language_code, tts_output_path,
-                       tts_engine=tts_engine, speed=ideal_speed, speaker_id=speaker_id)
+        cps = CPS_MAP.get(target_language_code, 14.0)
+        estimated_ms = int((len(translated_text) / cps) * 1000) if cps > 0 else original_duration_ms
+        estimated_ratio = estimated_ms / original_duration_ms if original_duration_ms > 0 else 1.0
 
-        generated_audio = AudioSegment.from_file(tts_output_path)
+        if estimated_ratio > 1.10:
+            generated_audio = synthesise_with_pauses(
+                translated_text,
+                original_duration_ms,
+                target_language_code,
+                tts_engine,
+                ideal_speed,
+                speaker_id,
+                i,
+            )
+            generated_audio.export(tts_output_path, format="wav")
+        else:
+            text_to_speech(translated_text, target_language_code, tts_output_path,
+                           tts_engine=tts_engine, speed=ideal_speed, speaker_id=speaker_id)
+            generated_audio = AudioSegment.from_file(tts_output_path)
 
-        # Phase 3a/3c: 4-strategy cascade — stretch, borrow gap, or fade-truncate
-        fitted_audio, _actual_ms = fit_tts_to_slot(generated_audio, original_duration_ms, next_gap_ms, i)
+        fitted_audio = fit_tts_to_slot(generated_audio, original_duration_ms, i)
         del generated_audio; gc.collect()
 
         processed_audio = fitted_audio  # noise_reduction skipped by default
@@ -987,17 +1103,8 @@ def adaptive_segment_processing(
     processed_segments_info = []
 
     for i, segment in enumerate(tqdm(segments_data, desc="Synthesising audio segments")):
-        # Phase 3c: compute gap to next segment for adaptive overflow borrowing
-        if i + 1 < len(segments_data):
-            next_start_s = segments_data[i + 1].get("start", segment.get("end", 0))
-            curr_end_s = segment.get("end", 0)
-            next_gap_ms = max(0, int((next_start_s - curr_end_s) * 1000))
-        else:
-            next_gap_ms = 0
-
         result = process_segment(
             (i, segment), target_language_code, segments_dir, tts_engine, speaker_id,
-            next_gap_ms=next_gap_ms,
         )
         if result:
             processed_segments_info.append(result)
@@ -1513,9 +1620,18 @@ def process_video(
                 translation_model, translation_tokenizer = load_translation_model(hw_tier)
 
             with performance_monitor.timer("batch_translation"):
+                merged_input_segments = merge_short_segments(
+                    transcript_data.get("segments", []),
+                    min_ms=MIN_SEGMENT_MS,
+                )
+                logging.info(
+                    f"[merge] {len(transcript_data.get('segments', []))} -> {len(merged_input_segments)} "
+                    f"segments after short-segment merge"
+                )
+
                 # First pass: translate all segments at length_penalty=1.0
                 translated_segments = batch_translate_segments(
-                    transcript_data['segments'],
+                    merged_input_segments,
                     source_language_detected,
                     target_language_code,
                     translation_model,
@@ -1531,7 +1647,7 @@ def process_video(
                 # Issue 11: timing budget pre-screen
                 translation_texts = [s['translated_text'] for s in translated_segments]
                 timing_budget = analyze_segment_timing_budget(
-                    transcript_data['segments'], translation_texts, target_language_code
+                    merged_input_segments, translation_texts, target_language_code
                 )
 
                 # Second pass: re-translate overflow segments with compression bias
@@ -1539,7 +1655,7 @@ def process_video(
                 if compress_indices:
                     logging.info(f"Compressing {len(compress_indices)} overflow translation(s) with length_penalty=0.6")
                     for idx in compress_indices:
-                        seg = transcript_data['segments'][idx]
+                        seg = merged_input_segments[idx]
                         available_ms = timing_budget[idx]['available_ms']
                         estimated_ms = timing_budget[idx]['estimated_ms']
                         compression_ratio = (available_ms * 1.3) / estimated_ms if estimated_ms > 0 else 1.0

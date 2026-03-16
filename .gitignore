@@ -3,3 +3,6 @@ PLAN_h.md
 CHECKLIST.md
 kaggle_ssh.md
 kaggle_run.ipynb
+fixes.md
+__pycache__/
+*.pyc

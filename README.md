@@ -81,7 +81,7 @@ videoTranslator/
 
 ## Prerequisites
 
-- Python **3.12**
+- Python **3.11+** (tested on 3.11 & 3.12)
 - Node.js + npm (for frontend)
 - FFmpeg in `PATH`
 - `rubberband-cli` installed (required by `pyrubberband`)
@@ -160,7 +160,7 @@ Install this if you want the pipeline to clone the original speaker's voice into
 
 ```bash
 sudo apt-get install sox
-pip install wheel
+pip install wheel packaging
 pip install -U flash-attn --no-build-isolation
 git clone https://github.com/QwenLM/Qwen3-TTS.git /tmp/qwen3tts
 sed -i 's/transformers==4.57.3/transformers>=4.47.1/' /tmp/qwen3tts/pyproject.toml
