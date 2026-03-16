@@ -28,7 +28,7 @@ gtts
 # Qwen3-TTS: pip install git+https://github.com/QwenLM/Qwen3-TTS.git
 
 # Video
-moviepy
+moviepy>=2.2.0
 
 # Web server
 fastapi
