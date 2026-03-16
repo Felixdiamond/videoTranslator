@@ -276,7 +276,7 @@ class TTSEngine:
                     "TTSEngine: Qwen3-TTS is not loaded. "
                     "Install it with: pip install -U qwen-tts"
                 )
-            self._synthesize_qwen3(text, language_code, output_path, speaker_id, instruct)
+            self._synthesize_qwen3(text, language_code, output_path, speaker_id, instruct, speed)
         elif self.mode == "melo" and self._melo is not None:
             self._synthesize_melo(text, language_code, output_path, speed, speaker_id)
         else:
@@ -311,8 +311,21 @@ class TTSEngine:
         output_path: str,
         speaker_id: Optional[str],
         instruct: str,
+        speed: float = 1.0,
     ) -> None:
         qwen_language = self._normalize_qwen_language(language_code)
+
+        # Translate speed float into a natural language pace instruction
+        if speed >= 1.3:
+            pace_instruct = "speak quickly and clearly"
+        elif speed <= 0.8:
+            pace_instruct = "speak slowly and clearly"
+        else:
+            pace_instruct = "speak at a natural pace"
+
+        # Merge with any caller-provided instruct
+        combined_instruct = f"{pace_instruct}. {instruct}".strip(". ") if instruct else pace_instruct
+
         kwargs = dict(text=text, language=qwen_language)
         try:
             if self._reference_embedding is not None:
@@ -329,7 +342,7 @@ class TTSEngine:
                 spk = speaker_id or "Ryan"
                 wavs, sr = self._qwen.generate_custom_voice(
                     speaker=spk,
-                    instruct=instruct,
+                    instruct=combined_instruct,
                     **kwargs,
                 )
             if _SF_AVAILABLE:
