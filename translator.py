@@ -993,13 +993,19 @@ def fit_tts_to_slot(
         logging.info(f"[fit_tts_to_slot] seg {segment_index}: natural fit ({ratio:.2f}), no adjustment")
         return tts_audio
 
+    STRETCH_FLOOR = 0.65
+    STRETCH_CEIL  = 1.50
+
     if ratio > 1.10:
-        # Try borrowing from next gap first before stretching or trimming
-        effective_ms = available_ms + next_gap_ms
+        # Try borrowing from next gap first before stretching or trimming.
+        # Cap the borrow so effective_ratio stays inside [STRETCH_FLOOR, STRETCH_CEIL]:
+        # borrowing too much pushes rate below 0.65, rubberband clamps silently, leaving a silent hole.
+        max_effective_ms = int(tts_ms / STRETCH_FLOOR)   # floor constraint: rate can't go below 0.65
+        raw_effective_ms = available_ms + next_gap_ms
+        effective_ms = min(raw_effective_ms, max_effective_ms)
         effective_ratio = tts_ms / effective_ms if effective_ms > 0 else ratio
 
-        if effective_ratio <= 1.50:
-            # Can fit within 1.5x using the gap — stretch to fill extended slot
+        if effective_ratio <= STRETCH_CEIL:
             stretched = advanced_time_stretch_v2(tts_audio, effective_ms)
             actual_borrow = effective_ms - available_ms
             logging.info(
@@ -1711,28 +1717,61 @@ def process_video(
                     merged_input_segments, translation_texts, target_language_code
                 )
 
-                # Second pass: re-translate overflow segments with compression bias
+                # Second pass: re-translate overflow segments with compression bias.
+                # Iterative schedule — tightens penalty each pass until the CPS estimate
+                # fits or all passes are exhausted. Normal segments exit after pass 1.
+                COMPRESSION_SCHEDULE = [
+                    (1.8, 0.85),   # pass 1 — gentle   (ratio threshold, target_ratio)
+                    (1.5, 0.70),   # pass 2 — moderate
+                    (1.3, 0.60),   # pass 3 — aggressive (last resort)
+                ]
+
                 compress_indices = [idx for idx, tb in enumerate(timing_budget) if tb['action'] == 'compress_translation']
                 if compress_indices:
-                    logging.info(f"Compressing {len(compress_indices)} overflow translation(s) with length_penalty=0.6")
+                    logging.info(f"Compressing {len(compress_indices)} overflow translation(s) with iterative schedule")
+                    _cps = CPS_MAP.get(target_language_code, 14.0)
                     for idx in compress_indices:
                         seg = merged_input_segments[idx]
                         available_ms = timing_budget[idx]['available_ms']
-                        estimated_ms = timing_budget[idx]['estimated_ms']
-                        compression_ratio = (available_ms * 1.3) / estimated_ms if estimated_ms > 0 else 1.0
-                        compressed = translate_with_length_target(
-                            seg['text'],
-                            source_language_detected,
-                            target_language_code,
-                            translation_model,
-                            translation_tokenizer,
-                            target_length_ratio=compression_ratio,
-                        )
-                        translated_segments[idx]['translated_text'] = compressed
-                        logging.info(
-                            f"  Segment {idx}: ratio={timing_budget[idx]['ratio']:.2f} "
-                            f"compressed to '{compressed[:50]}…'"
-                        )
+                        current_translation = translated_segments[idx]['translated_text']
+
+                        for pass_num, (ratio_threshold, target_ratio) in enumerate(COMPRESSION_SCHEDULE, 1):
+                            # Check if the current translation already fits
+                            estimated_ms = int((len(current_translation) / _cps) * 1000) if _cps > 0 else available_ms
+                            current_ratio = estimated_ms / available_ms if available_ms > 0 else 1.0
+
+                            if current_ratio <= ratio_threshold:
+                                logging.info(
+                                    f"  Segment {idx}: ratio={current_ratio:.2f} fits after pass {pass_num - 1}, "
+                                    f"no further compression needed"
+                                )
+                                break
+
+                            compressed = translate_with_length_target(
+                                seg['text'],
+                                source_language_detected,
+                                target_language_code,
+                                translation_model,
+                                translation_tokenizer,
+                                target_length_ratio=target_ratio,
+                            )
+                            new_estimated_ms = int((len(compressed) / _cps) * 1000) if _cps > 0 else available_ms
+                            new_ratio = new_estimated_ms / available_ms if available_ms > 0 else 1.0
+
+                            if new_ratio < current_ratio:
+                                current_translation = compressed
+                                logging.info(
+                                    f"  Segment {idx} pass {pass_num}: ratio {current_ratio:.2f} → {new_ratio:.2f} "
+                                    f"(target_ratio={target_ratio}) -> '{compressed[:50]}…'"
+                                )
+                            else:
+                                logging.info(
+                                    f"  Segment {idx} pass {pass_num}: compression did not improve "
+                                    f"({current_ratio:.2f} -> {new_ratio:.2f}), keeping previous"
+                                )
+                                break
+
+                        translated_segments[idx]['translated_text'] = current_translation
 
             # Release translation model BEFORE TTS loads — sequential VRAM lifecycle (A1).
             # At this point: Demucs already unloaded (step 2), Whisper unloaded (step 3),
