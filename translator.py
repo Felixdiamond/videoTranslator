@@ -127,12 +127,12 @@ WHISPER_MODEL_TIERS: Dict[str, str] = {
 # Run:  python calibrate_cps.py  and paste the output here.
 # Only MeloTTS-supported languages are listed. DE/PT use gTTS which has no speed control.
 CPS_MAP: Dict[str, float] = {
-    "en": 15.0,
-    "es": 16.0,
-    "fr": 14.0,
-    "zh": 8.0,
-    "ja": 10.0,
-    "ko": 11.0,
+    "en": 13.8,
+    "fr": 18.3,
+    "es": 13.1,
+    "zh": 6.1,
+    "ja": 6.2,
+    "ko": 5.7,
 }
 
 # --- Phase 3: NLLB-200 translation model tiers ---
