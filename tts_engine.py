@@ -67,7 +67,21 @@ except ImportError:
 # Speaker registry (Issue 4a)
 # ---------------------------------------------------------------------------
 
+# Default generation kwargs for Qwen3-TTS (Fix D).
+# Without do_sample=True the model uses greedy decoding which produces flat,
+# monotonic, robotic speech. These match the values from official examples.
+_QWEN_GEN_DEFAULTS: dict = dict(
+    max_new_tokens=2048,
+    do_sample=True,
+    top_k=50,
+    top_p=1.0,
+    temperature=0.9,
+    repetition_penalty=1.05,
+)
+
 #: All known MeloTTS speaker IDs per language code.
+#: DE and PT are intentionally absent — MeloTTS has no model/config for them.
+#: Requests for those languages are routed to gTTS automatically.
 MELO_ALL_SPEAKERS: Dict[str, list] = {
     "en": ["EN-US", "EN-BR", "EN_INDIA", "EN-AU", "EN-Default"],
     "es": ["ES"],
@@ -75,8 +89,6 @@ MELO_ALL_SPEAKERS: Dict[str, list] = {
     "zh": ["ZH"],
     "ja": ["JP"],
     "ko": ["KR"],
-    "de": ["DE"],
-    "pt": ["PT"],
 }
 
 
@@ -192,10 +204,24 @@ class TTSEngine:
         logging.info(
             f"TTSEngine: loading Qwen3-TTS '{model_id}' on device='{device_str}' with dtype='{dtype}'"
         )
+        # Fix G: Flash Attention 2 significantly reduces VRAM and speeds up inference.
+        # Requires: pip install flash-attn
+        extra_kwargs: dict = {}
+        if device_str.startswith("cuda"):
+            try:
+                import flash_attn  # noqa: F401
+                extra_kwargs["attn_implementation"] = "flash_attention_2"
+                logging.info("TTSEngine: using Flash Attention 2 for Qwen3-TTS.")
+            except ImportError:
+                logging.info(
+                    "TTSEngine: flash-attn not installed — using default attention. "
+                    "Install with: pip install flash-attn"
+                )
         self._qwen = Qwen3TTSModel.from_pretrained(
             model_id,
             device_map=device_str,
             dtype=dtype,
+            **extra_kwargs,
         )
         self._qwen_variant = variant
         logging.info("TTSEngine: Qwen3-TTS ready.")
@@ -230,12 +256,18 @@ class TTSEngine:
         logging.info(
             f"TTSEngine: extracting voice embedding from '{reference_audio_path}'"
         )
+        # Fix E: ICL mode (x_vector_only_mode=False) requires non-empty ref_text.
+        # Auto-switch to x-vector-only when no transcript is provided.
+        use_icl = bool(reference_text and reference_text.strip())
         self._reference_embedding = self._qwen.create_voice_clone_prompt(
             ref_audio=reference_audio_path,
-            ref_text=reference_text,
-            x_vector_only_mode=False,   # full prompt embedding for best quality
+            ref_text=reference_text if use_icl else None,
+            x_vector_only_mode=not use_icl,
         )
-        logging.info("TTSEngine: voice-clone embedding cached.")
+        logging.info(
+            f"TTSEngine: voice-clone embedding cached "
+            f"(mode={'ICL' if use_icl else 'x-vector-only'})"
+        )
         return True
 
     # ------------------------------------------------------------------
@@ -329,8 +361,16 @@ class TTSEngine:
         kwargs = dict(text=text, language=qwen_language)
         try:
             if self._reference_embedding is not None:
+                # Fix F: generate_voice_clone does not accept instruct — style
+                # is controlled by the reference audio in ICL/x-vector mode.
+                if pace_instruct != "speak at a natural pace":
+                    logging.info(
+                        "[Qwen3-TTS] Pace instruction ignored for voice-clone (style "
+                        "is set by reference audio, not instruct text)."
+                    )
                 wavs, sr = self._qwen.generate_voice_clone(
                     voice_clone_prompt=self._reference_embedding,
+                    **_QWEN_GEN_DEFAULTS,
                     **kwargs,
                 )
             else:
@@ -343,6 +383,7 @@ class TTSEngine:
                 wavs, sr = self._qwen.generate_custom_voice(
                     speaker=spk,
                     instruct=combined_instruct,
+                    **_QWEN_GEN_DEFAULTS,
                     **kwargs,
                 )
             if _SF_AVAILABLE:

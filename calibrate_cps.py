@@ -19,8 +19,7 @@ REFERENCE_SENTENCES = {
     "en": "Hello, I am doing well and the weather is nice today.",        # 53 chars
     "fr": "Bonjour, je vais bien et le temps est agréable aujourd'hui.",   # 59 chars
     "es": "Hola, estoy bien y el tiempo es agradable hoy.",                # 47 chars
-    "de": "Hallo, mir geht es gut und das Wetter ist heute schön.",         # 54 chars
-    "pt": "Olá, estou bem e o tempo está agradável hoje.",                  # 46 chars
+    # DE and PT removed — MeloTTS has no model for them
     "zh": "你好，我今天很好，天气也很好。",                                        # 15 chars
     "ja": "こんにちは、今日は元気で、天気もいいです。",                               # 20 chars
     "ko": "안녕하세요, 저는 잘 지내고 있고 오늘 날씨도 좋습니다.",                    # 26 chars
@@ -30,8 +29,7 @@ LANGUAGE_MODEL_MAP = {
     "en": {"melo_language": "EN", "speaker_id": "EN-US"},
     "fr": {"melo_language": "FR", "speaker_id": "FR"},
     "es": {"melo_language": "ES", "speaker_id": "ES"},
-    "de": {"melo_language": "DE", "speaker_id": "DE"},
-    "pt": {"melo_language": "PT", "speaker_id": "PT"},
+    # DE and PT removed — MeloTTS has no model for them
     "zh": {"melo_language": "ZH", "speaker_id": "ZH"},
     "ja": {"melo_language": "JP", "speaker_id": "JP"},
     "ko": {"melo_language": "KR", "speaker_id": "KR"},

@@ -99,12 +99,13 @@ LANGUAGE_MODEL_MAP: Dict[str, Dict[str, str]] = {
     "en": {"melo_language": "EN", "speaker_id": "EN-US", "gtts_lang": "en"},
     "es": {"melo_language": "ES", "speaker_id": "ES", "gtts_lang": "es"},
     "fr": {"melo_language": "FR", "speaker_id": "FR", "gtts_lang": "fr"},
-    "zh": {"melo_language": "ZH", "speaker_id": "ZH", "gtts_lang": "zh-CN"}, # gTTS uses zh-CN for Mandarin
-    "ja": {"melo_language": "JP", "speaker_id": "JP", "gtts_lang": "ja"}, # Changed jp to ja for gTTS
-    "ko": {"melo_language": "KR", "speaker_id": "KR", "gtts_lang": "ko"}, # Changed kr to ko for gTTS
-    # Add other languages as needed, ensuring gTTS compatibility
-    "de": {"melo_language": "DE", "speaker_id": "DE_FEMALE", "gtts_lang": "de"}, # Example, check Melo speaker IDs
-    "pt": {"melo_language": "PT", "speaker_id": "PT_FEMALE", "gtts_lang": "pt"}, # Example
+    "zh": {"melo_language": "ZH", "speaker_id": "ZH", "gtts_lang": "zh-CN"},
+    "ja": {"melo_language": "JP", "speaker_id": "JP", "gtts_lang": "ja"},
+    "ko": {"melo_language": "KR", "speaker_id": "KR", "gtts_lang": "ko"},
+    # DE and PT: gTTS-only — MeloTTS has no model for these languages.
+    # Do NOT add melo_language or speaker_id here; process_video gates on supported set.
+    "de": {"gtts_lang": "de"},
+    "pt": {"gtts_lang": "pt"},
 }
 
 DUCKING_GAIN_DB = -18  # How much to reduce original audio volume during translated speech
@@ -124,6 +125,7 @@ WHISPER_MODEL_TIERS: Dict[str, str] = {
 # --- Phase 3b: Empirical chars/sec per language at MeloTTS speed=1.0 ---
 # NOTE: These values should be re-calibrated after any MeloTTS update.
 # Run:  python calibrate_cps.py  and paste the output here.
+# Only MeloTTS-supported languages are listed. DE/PT use gTTS which has no speed control.
 CPS_MAP: Dict[str, float] = {
     "en": 15.0,
     "es": 16.0,
@@ -131,8 +133,6 @@ CPS_MAP: Dict[str, float] = {
     "zh": 8.0,
     "ja": 10.0,
     "ko": 11.0,
-    "de": 13.0,
-    "pt": 15.0,
 }
 
 # --- Phase 3: NLLB-200 translation model tiers ---
@@ -951,13 +951,18 @@ def estimate_ideal_tts_speed(
     text: str,
     original_duration_ms: int,
     lang_code: str,
+    tts_mode: str = "melo",
 ) -> float:
     """
-    Phase 3b: Pre-TTS speed estimation.
-    Estimates the MeloTTS speed parameter so the synthesised audio lands close
-    to original_duration_ms before any post-hoc time-stretch is applied.
+    Phase 3b: Pre-TTS speed estimation (MeloTTS only).
+    For Qwen3/gTTS, returns 1.0 immediately — speed is not a numeric parameter there.
+    Requires the language to be in CPS_MAP (MeloTTS-supported set).
     """
-    cps = CPS_MAP.get(lang_code, 14.0)
+    if tts_mode != "melo":
+        return 1.0
+    if lang_code not in CPS_MAP:
+        return 1.0  # language not supported by MeloTTS, no CPS data
+    cps = CPS_MAP[lang_code]
     if cps <= 0 or original_duration_ms <= 0 or not text.strip():
         return 1.0
     estimated_duration_s = len(text) / cps
@@ -1072,8 +1077,6 @@ def process_segment(
 
     tts_output_path = os.path.join(segments_dir, f"segment_{i:04d}.wav")
 
-    # Phase 3b: pre-estimate TTS speed to minimise required post-hoc stretch
-    ideal_speed = estimate_ideal_tts_speed(translated_text, original_duration_ms, target_language_code)
 
     # Phase 1c: use word-level start for more precise overlay position
     words = segment.get("words", [])
@@ -1082,9 +1085,18 @@ def process_segment(
         start_time_ms = max(0, int(word_starts[0] * 1000) - 30)  # 30ms pre-roll pad
 
     try:
-        cps = CPS_MAP.get(target_language_code, 14.0)
-        estimated_ms = int((len(translated_text) / cps) * 1000) if cps > 0 else original_duration_ms
-        estimated_ratio = estimated_ms / original_duration_ms if original_duration_ms > 0 else 1.0
+        # CPS estimation only valid for MeloTTS — skip for Qwen3/gTTS
+        tts_mode_active = tts_engine.mode if tts_engine is not None else "gtts"
+        ideal_speed = estimate_ideal_tts_speed(
+            translated_text, original_duration_ms, target_language_code, tts_mode=tts_mode_active
+        )
+
+        if tts_mode_active == "melo" and target_language_code in CPS_MAP:
+            cps = CPS_MAP[target_language_code]
+            estimated_ms = int((len(translated_text) / cps) * 1000)
+            estimated_ratio = estimated_ms / original_duration_ms if original_duration_ms > 0 else 1.0
+        else:
+            estimated_ratio = 1.0  # no CPS estimate available — synthesise normally
 
         if estimated_ratio < 0.75 and original_duration_ms > 1200:
             # Underflow with enough room: use clause-level pauses to fill naturally
@@ -1766,10 +1778,18 @@ def process_video(
                                     ref_text = str(ref_sample.get("text") or "")
                                     tts_engine.extract_voice_embedding(ref_audio, ref_text)
                         else:  # "melo" (default) or unrecognised mode
-                            melo_lang = LANGUAGE_MODEL_MAP.get(
-                                target_language_code, {}
-                            ).get("melo_language", "EN")
-                            tts_engine.load_melo(melo_lang)
+                            MELO_SUPPORTED = {"en", "es", "fr", "zh", "ja", "ko"}
+                            if target_language_code not in MELO_SUPPORTED:
+                                logging.warning(
+                                    f"[TTS] MeloTTS does not support '{target_language_code}'. "
+                                    "Falling back to gTTS for this language."
+                                )
+                                tts_engine.mode = "gtts"
+                            else:
+                                melo_lang = LANGUAGE_MODEL_MAP.get(
+                                    target_language_code, {}
+                                ).get("melo_language", "EN")
+                                tts_engine.load_melo(melo_lang)
 
                     synced_translated_speech_track = create_synced_audio_track(
                         original_audio_segment,
