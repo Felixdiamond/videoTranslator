@@ -55,8 +55,6 @@ Here's a sample of the VideoTranslator in action!
 I translated the first 5 minutes of this video by Fern:
 - **Original Video (English):** [The Hunt for America's Smartest Killer](https://youtu.be/wkVygetgeRY?si=hKF2XqJD3jZU3KIL)
 
-The full 28-minute video wasn't translated as it would take a significant amount of time (likely well over an hour) on Kaggle T4 GPU at 360p resolution. This 5-minute clip demonstrates the translation quality and process.
-
 - **Translated Output (First 5 mins, French):** [View Translated Sample (translated_fern_fr.mp4)](./translated_fern_fr.mp4)
 
 ---
@@ -332,11 +330,16 @@ Logs are written to `logs/video_translator.log`.
 
 ---
 
-## Status and next focus
+## Status and plans
 
-Major quality/stability milestones from the implementation plan are completed (ASR alignment, Demucs mixing, NLLB migration, config-driven model control, FFmpeg final mux).
+Major quality/stability milestones from the implementation plan are completed (ASR alignment, Demucs mixing, NLLB migration, config-driven model control, error handling, performance optimization, better pacing, UI enhancements, FFmpeg final mux).
 
-Remaining focus is mostly validation and iterative quality tuning (long-form tests, edge-case handling, voice naturalness).
+## Future plans
+
+- Subtitle generation
+- Even better speech detection
+- More language support
+- More natural pacing
 
 ---
 
