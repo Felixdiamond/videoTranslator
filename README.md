@@ -190,7 +190,7 @@ Kaggle session settings:
 Minimal Kaggle run flow:
 1. Open `videotranslator.ipynb` in Kaggle.
 2. Run cells in order.
-3. Keep TTS mode on `qwen3`.
+3. Keep TTS mode on `melo`.
 4. Run translation cell with your input video path and target language.
 
 The notebook includes Kaggle-specific setup quirks handling (dependency pin relaxations and install order) to reduce environment breakage on latest images.
