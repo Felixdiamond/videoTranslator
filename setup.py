@@ -18,7 +18,7 @@ def check_python_version():
         sys.exit(1)
     print(f"Python version {current_version.major}.{current_version.minor}.{current_version.micro} is compatible.")
 
-def run_command(command, cwd=None, env=None):
+def run_command(command, cwd=None, env=None, allow_failure=False):
     print(f"Running: {' '.join(command) if isinstance(command, list) else command}")
     try:
         process = subprocess.run(
@@ -35,10 +35,17 @@ def run_command(command, cwd=None, env=None):
             print(e.stdout)
         if e.stderr:
             print(e.stderr)
+        if allow_failure:
+            print("Command failed but setup will continue (allow_failure=True).")
+            return False
         sys.exit(1)
     except FileNotFoundError:
         print(f"Error: '{command[0] if isinstance(command, list) else command.split()[0]}' not found in PATH.")
+        if allow_failure:
+            print("Command not found but setup will continue (allow_failure=True).")
+            return False
         sys.exit(1)
+    return True
 
 
 def create_venv(project_root):
@@ -74,17 +81,7 @@ def patch_file(path, replacements):
 
 def setup_melo_tts(project_root, pip_executable):
     print("\nSetting up MeloTTS...")
-    if not shutil.which("git"):
-        print("Error: git not found in PATH.")
-        sys.exit(1)
-
-    melo_tts_dir = os.path.join(project_root, "MeloTTS")
-    if not os.path.isdir(melo_tts_dir):
-        run_command(["git", "clone", "https://github.com/Felixdiamond/MeloTTS.git", melo_tts_dir], cwd=project_root)
-    else:
-        run_command(["git", "-C", melo_tts_dir, "pull"])
-
-    run_command([pip_executable, "install", "--no-build-isolation", "-e", "."], cwd=melo_tts_dir)
+    run_command([pip_executable, "install", "git+https://github.com/Felixdiamond/MeloTTS.git"])
     python_executable = get_python_executable(os.path.join(project_root, "venv"))
     run_command([python_executable, "-m", "unidic", "download"])
     print("MeloTTS setup complete.")
@@ -108,6 +105,25 @@ def setup_whisperx(project_root, pip_executable):
 
 def setup_qwen3_tts(project_root, pip_executable):
     print("\nSetting up Qwen3-TTS...")
+    run_command([pip_executable, "install", "wheel", "packaging"])
+
+    flash_ok = run_command(
+        [pip_executable, "install", "-U", "flash-attn", "--no-build-isolation"],
+        allow_failure=True,
+    )
+    if not flash_ok:
+        print(
+            "Warning: flash-attn install failed. Qwen3-TTS may still work without it, "
+            "but slower."
+        )
+
+    if not shutil.which("sox"):
+        print("Warning: 'sox' not found. README suggests: sudo apt-get install sox")
+
+    if not shutil.which("git"):
+        print("Error: git not found in PATH.")
+        sys.exit(1)
+
     qwen3_dir = os.path.join(project_root, ".deps", "qwen3tts")
     os.makedirs(os.path.dirname(qwen3_dir), exist_ok=True)
     if not os.path.isdir(qwen3_dir):
@@ -121,16 +137,11 @@ def setup_qwen3_tts(project_root, pip_executable):
     print("Qwen3-TTS setup complete.")
 
 
-def setup_backend(project_root, venv_dir, tts):
+def setup_backend(project_root, venv_dir):
     print("\nSetting up backend dependencies...")
     pip_executable = get_pip_executable(venv_dir)
     requirements_file = os.path.join(project_root, "requirements.txt")
     run_command([pip_executable, "install", "-r", requirements_file])
-    setup_whisperx(project_root, pip_executable)
-    if "melo" in tts:
-        setup_melo_tts(project_root, pip_executable)
-    if "qwen3" in tts:
-        setup_qwen3_tts(project_root, pip_executable)
 
 
 def setup_frontend(project_root):
@@ -179,8 +190,14 @@ def main():
 
     check_python_version()
     venv_dir = create_venv(project_root)
-    setup_backend(project_root, venv_dir, tts)
+    setup_backend(project_root, venv_dir)
     setup_frontend(project_root)
+
+    pip_executable = get_pip_executable(venv_dir)
+    if "melo" in tts:
+        setup_melo_tts(project_root, pip_executable)
+    if "qwen3" in tts:
+        setup_qwen3_tts(project_root, pip_executable)
 
     print("\nSetup complete.")
     print("\nNext Steps:")

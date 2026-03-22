@@ -215,6 +215,12 @@ source venv/bin/activate
 python server.py
 ```
 
+Optional backend environment variables (for hosted deployments):
+
+- `CORS_ORIGINS`: comma-separated allowed origins (example: `https://app.example.com,https://staging.example.com`)
+- `FRONTEND_URL`: single frontend origin to append to CORS allow-list
+- `CORS_ALLOW_ALL`: `true/1` to allow all origins (development/trusted environments only)
+
 ### 3) CLI only
 
 ```bash
@@ -229,6 +235,20 @@ python translator.py ./sample.mp4 fr
 ```
 
 Outputs are created in `*_translated_output/` directories.
+
+### Frontend API/WS base URLs
+
+The Next.js frontend defaults to local development URLs:
+
+- `NEXT_PUBLIC_API_BASE_URL=http://localhost:8000`
+- `NEXT_PUBLIC_WS_BASE_URL=ws://localhost:8000`
+
+For hosted deployments, set these in `video-translator/.env.local` (or your hosting env config):
+
+```bash
+NEXT_PUBLIC_API_BASE_URL=https://api.example.com
+NEXT_PUBLIC_WS_BASE_URL=wss://api.example.com
+```
 
 ---
 
@@ -258,18 +278,40 @@ qwen3_model_size: "1.7B"
 
 ## API surface (current)
 
+### Health endpoint
+
+- `GET /health`
+- Returns basic service status (`{"ok": true}`)
+
+### Frontend options endpoint
+
+- `GET /options`
+- Returns frontend configuration payload:
+  - available languages + labels
+  - TTS modes
+  - Qwen3 model sizes
+  - Melo speaker IDs by language
+  - API defaults used by frontend controls
+
 ### Upload endpoint
 - `POST /upload`
 - Receives a file and stores it in `uploaded_files/`
+- Returns project-relative `filePath`
+
+### Output file endpoint
+
+- `GET /files/{file_path}`
+- Serves project files by relative path (used by frontend download link)
 
 ### Translation WebSocket
 - `WS /translate/{video_path}/{target_language}`
 - Query params:
   - `tts_mode` (default `melo`)
+  - `qwen3_model_size` (`0.6B` or `1.7B`, default `1.7B`)
   - `speaker_id` (Melo speaker)
-  - `enable_voice_cloning` (bool)
+  - `enable_voice_cloning` (bool, default `true`)
 
-Frontend currently uses the default WebSocket parameters unless customized.
+The frontend now exposes and sends these controls directly.
 
 ---
 
