@@ -1,10 +1,11 @@
+import argparse
 import os
 import subprocess
 import sys
 import venv
-import shutil # For checking if git is available
+import shutil
 
-MIN_PYTHON_VERSION = (3, 11, 0) # Minimum required Python version (3.11.0)
+MIN_PYTHON_VERSION = (3, 11, 0)
 RECOMMENDED_PYTHON_VERSION_STR = ">= 3.11.9"
 
 def check_python_version():
@@ -17,32 +18,34 @@ def check_python_version():
         sys.exit(1)
     print(f"Python version {current_version.major}.{current_version.minor}.{current_version.micro} is compatible.")
 
-def run_command(command, cwd=None, env=None):
-    print(f"Running command: {' '.join(command) if isinstance(command, list) else command}")
+def run_command(command, cwd=None, env=None, allow_failure=False):
+    print(f"Running: {' '.join(command) if isinstance(command, list) else command}")
     try:
-        # Use a list of args for better cross-platform compatibility and security than shell=True
-        # For commands like 'source', shell=True might still be needed or handled differently.
-        if isinstance(command, str) and ("&&" in command or ">" in command or "<" in command or "|" in command or "source" in command):
-             # For complex shell commands, keep shell=True but be mindful of security.
-            process = subprocess.run(command, check=True, shell=True, cwd=cwd, env=env, capture_output=True, text=True)
-        else:
-            process = subprocess.run(command if isinstance(command, list) else command.split(), check=True, cwd=cwd, env=env, capture_output=True, text=True)
-        
+        process = subprocess.run(
+            command if isinstance(command, list) else command.split(),
+            check=True, cwd=cwd, env=env, capture_output=True, text=True,
+        )
         if process.stdout:
             print(process.stdout)
         if process.stderr:
-            print(f"Stderr from command: {process.stderr}")
-
+            print(process.stderr)
     except subprocess.CalledProcessError as e:
-        print(f"Error running command: {' '.join(e.cmd) if isinstance(e.cmd, list) else e.cmd}")
+        print(f"Error: {' '.join(e.cmd) if isinstance(e.cmd, list) else e.cmd}")
         if e.stdout:
-            print(f"Stdout: {e.stdout}")
+            print(e.stdout)
         if e.stderr:
-            print(f"Stderr: {e.stderr}")
+            print(e.stderr)
+        if allow_failure:
+            print("Command failed but setup will continue (allow_failure=True).")
+            return False
         sys.exit(1)
     except FileNotFoundError:
-        print(f"Error: Command '{command[0] if isinstance(command, list) else command.split()[0]}' not found. Is it in your PATH?")
+        print(f"Error: '{command[0] if isinstance(command, list) else command.split()[0]}' not found in PATH.")
+        if allow_failure:
+            print("Command not found but setup will continue (allow_failure=True).")
+            return False
         sys.exit(1)
+    return True
 
 
 def create_venv(project_root):
@@ -67,37 +70,71 @@ def get_pip_executable(venv_dir):
     else:
         return os.path.join(venv_dir, "bin", "pip")
 
+def patch_file(path, replacements):
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    for old, new in replacements:
+        content = content.replace(old, new)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
 def setup_melo_tts(project_root, pip_executable):
     print("\nSetting up MeloTTS...")
-    melo_tts_dir = os.path.join(project_root, "MeloTTS") # Expecting MeloTTS to be cloned here or already present
+    run_command([pip_executable, "install", "git+https://github.com/Felixdiamond/MeloTTS.git"])
+    python_executable = get_python_executable(os.path.join(project_root, "venv"))
+    run_command([python_executable, "-m", "unidic", "download"])
+    print("MeloTTS setup complete.")
+
+
+def setup_whisperx(project_root, pip_executable):
+    print("\nSetting up whisperX...")
+    whisperx_dir = os.path.join(project_root, ".deps", "whisperx")
+    os.makedirs(os.path.dirname(whisperx_dir), exist_ok=True)
+    if not os.path.isdir(whisperx_dir):
+        run_command(["git", "clone", "https://github.com/m-bain/whisperX.git", whisperx_dir])
+    else:
+        run_command(["git", "-C", whisperx_dir, "pull"])
+    patch_file(os.path.join(whisperx_dir, "pyproject.toml"), [
+        ("torch~=2.8.0", "torch>=2.8.0"),
+        ("torchaudio~=2.8.0", "torchaudio>=2.8.0"),
+    ])
+    run_command([pip_executable, "install", "-e", whisperx_dir])
+    print("whisperX setup complete.")
+
+
+def setup_qwen3_tts(project_root, pip_executable):
+    print("\nSetting up Qwen3-TTS...")
+    run_command([pip_executable, "install", "wheel", "packaging"])
+
+    flash_ok = run_command(
+        [pip_executable, "install", "-U", "flash-attn", "--no-build-isolation"],
+        allow_failure=True,
+    )
+    if not flash_ok:
+        print(
+            "Warning: flash-attn install failed. Qwen3-TTS may still work without it, "
+            "but slower."
+        )
+
+    if not shutil.which("sox"):
+        print("Warning: 'sox' not found. README suggests: sudo apt-get install sox")
 
     if not shutil.which("git"):
-        print("Error: git command not found. Please install git and ensure it's in your PATH to clone MeloTTS.")
-        # Optionally, provide instructions or skip this step if MeloTTS dir exists.
-        if not os.path.isdir(melo_tts_dir):
-             sys.exit(1)
-        else:
-            print(f"git not found, but MeloTTS directory '{melo_tts_dir}' exists. Assuming manual setup or pre-cloned.")
+        print("Error: git not found in PATH.")
+        sys.exit(1)
 
-
-    if not os.path.isdir(melo_tts_dir):
-        print("Cloning MeloTTS repository...")
-        run_command(["git", "clone", "https://github.com/myshell-ai/MeloTTS.git", melo_tts_dir], cwd=project_root)
+    qwen3_dir = os.path.join(project_root, ".deps", "qwen3tts")
+    os.makedirs(os.path.dirname(qwen3_dir), exist_ok=True)
+    if not os.path.isdir(qwen3_dir):
+        run_command(["git", "clone", "https://github.com/QwenLM/Qwen3-TTS.git", qwen3_dir])
     else:
-        print(f"MeloTTS directory '{melo_tts_dir}' already exists. Skipping clone.")
-        # Optionally, add logic to pull latest changes:
-        # print("Pulling latest changes for MeloTTS...")
-        # run_command(["git", "pull"], cwd=melo_tts_dir)
-
-
-    print("Installing MeloTTS package...")
-    run_command([pip_executable, "install", "-e", "."], cwd=melo_tts_dir)
-
-    print("Downloading UniDic for Japanese support in MeloTTS...")
-    # This command uses the python from the venv
-    python_executable = get_python_executable(os.path.join(project_root, "venv"))
-    run_command([python_executable, "-m", "unidic", "download"], cwd=melo_tts_dir)
-    print("MeloTTS setup complete.")
+        run_command(["git", "-C", qwen3_dir, "pull"])
+    patch_file(os.path.join(qwen3_dir, "pyproject.toml"), [
+        ("transformers==4.57.3", "transformers>=4.47.1"),
+    ])
+    run_command([pip_executable, "install", "-e", qwen3_dir])
+    print("Qwen3-TTS setup complete.")
 
 
 def setup_backend(project_root, venv_dir):
@@ -105,9 +142,6 @@ def setup_backend(project_root, venv_dir):
     pip_executable = get_pip_executable(venv_dir)
     requirements_file = os.path.join(project_root, "requirements.txt")
     run_command([pip_executable, "install", "-r", requirements_file])
-    
-    # After installing base requirements, setup MeloTTS
-    setup_melo_tts(project_root, pip_executable)
 
 
 def setup_frontend(project_root):
@@ -124,32 +158,48 @@ def setup_frontend(project_root):
         return # Or sys.exit(1) if frontend is mandatory
 
     if not os.path.exists(os.path.join(frontend_dir, "node_modules")):
-        print("Installing frontend dependencies (npm install)...")
         run_command(["npm", "install"], cwd=frontend_dir)
     else:
-        print("Frontend dependencies (node_modules) already exist. Skipping npm install.")
+        print("node_modules already exists, skipping npm install.")
     print("Frontend setup complete.")
 
 
-def main():
-    # Ensure we're in the project root directory where setup.py is located
-    project_root = os.path.dirname(os.path.abspath(__file__))
-    os.chdir(project_root) # Change current working directory to project root
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Bootstrap videoTranslator. whisperX and Qwen3-TTS are installed by default; add --melo to install MeloTTS as an additional engine."
+    )
+    parser.add_argument("--qwen3", action="store_true", default=True, help="Install Qwen3-TTS (primary TTS engine, on by default).")
+    parser.add_argument("--no-qwen3", dest="qwen3", action="store_false", help="Skip Qwen3-TTS install.")
+    parser.add_argument("--melo", action="store_true", help="Also install Felixdiamond/MeloTTS.")
+    return parser.parse_args()
 
-    print(f"Project root directory: {project_root}")
+
+def main():
+    args = parse_args()
+    tts = set()
+    if args.qwen3:
+        tts.add("qwen3")
+    if args.melo:
+        tts.add("melo")
+
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    os.chdir(project_root)
+
+    print(f"Project root: {project_root}")
+    print(f"TTS engines to install: {', '.join(sorted(tts)) if tts else 'none (gtts fallback only)'}")
 
     check_python_version()
-
-    # Create/ensure virtual environment
     venv_dir = create_venv(project_root)
-
-    # Setup backend (including MeloTTS)
     setup_backend(project_root, venv_dir)
-
-    # Setup frontend
     setup_frontend(project_root)
 
-    print("\n🎉🎉🎉 Setup complete! 🎉🎉🎉")
+    pip_executable = get_pip_executable(venv_dir)
+    if "qwen3" in tts:
+        setup_qwen3_tts(project_root, pip_executable)
+    if "melo" in tts:
+        setup_melo_tts(project_root, pip_executable)
+
+    print("\nSetup complete.")
     print("\nNext Steps:")
     print("1. Activate the virtual environment:")
     if sys.platform == "win32":

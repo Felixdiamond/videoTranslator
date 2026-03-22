@@ -1,10 +1,10 @@
 "use client";
 
-import React, { useState, useRef } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
-import { Loader2, FolderOpen } from "lucide-react";
+import { Loader2, FolderOpen, Globe2, Sparkles, WandSparkles } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import {
   Select,
@@ -14,258 +14,549 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
-// Updated LANGUAGE_MODEL_MAP to match translator.py (keys are important)
-// Values are display names for the dropdown.
-const LANGUAGE_MODEL_MAP = {
-  en: "English (US Speaker)",
-  es: "Spanish (Spain Speaker)",
-  fr: "French (France Speaker)",
-  zh: "Chinese (Mandarin Speaker)",
-  ja: "Japanese (Japan Speaker)", // Changed from jp
-  ko: "Korean (Korea Speaker)",   // Changed from kr
-  de: "German (Female Speaker)",
-  pt: "Portuguese (Female Speaker)",
-  // Add other languages from translator.py's map if they are intended for frontend selection
+type LanguageOption = {
+  code: string;
+  label: string;
+  supportsMelo: boolean;
+  defaultSpeakerId?: string;
 };
 
-export default function Home() {
-  const [videoPath, setVideoPath] = useState(""); // Stores the display name of the file
-  const [selectedFile, setSelectedFile] = useState<File | null>(null); // Type annotation for File
-  const [targetLanguage, setTargetLanguage] = useState("");
-  const [isTranslating, setIsTranslating] = useState(false);
-  const [progress, setProgress] = useState(0); // Progress might be less granular now
-  const [status, setStatus] = useState("");
-  const [translatedVideoUrl, setTranslatedVideoUrl] = useState<string | null>(null); // Type annotation
-  const { toast } = useToast();
-  const fileInputRef = useRef<HTMLInputElement | null>(null); // Type for ref
+type TtsModeOption = {
+  value: "melo" | "qwen3" | "gtts";
+  label: string;
+};
 
-  const handleFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => { // Type for event
-    const file = event.target.files?.[0];
-    if (file) {
-      setSelectedFile(file);
-      setVideoPath(file.name); // Display name
-      setTranslatedVideoUrl(null); // Reset previous result
-      setProgress(0);
-      setStatus("");
+type OptionsResponse = {
+  languages: LanguageOption[];
+  ttsModes: TtsModeOption[];
+  qwen3ModelSizes: string[];
+  meloSpeakerIdsByLanguage: Record<string, string[]>;
+  defaults?: {
+    ttsMode?: "melo" | "qwen3" | "gtts";
+    qwen3ModelSize?: string;
+    enableVoiceCloning?: boolean;
+  };
+};
+
+const API_BASE_URL = (process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000").replace(/\/$/, "");
+const DEFAULT_WS_BASE_URL = API_BASE_URL.replace(/^http/, "ws");
+const WS_BASE_URL = (process.env.NEXT_PUBLIC_WS_BASE_URL || DEFAULT_WS_BASE_URL).replace(/\/$/, "");
+
+const FALLBACK_OPTIONS: OptionsResponse = {
+  languages: [
+    { code: "en", label: "English (US Speaker)", supportsMelo: true, defaultSpeakerId: "EN-US" },
+    { code: "es", label: "Spanish (Spain Speaker)", supportsMelo: true, defaultSpeakerId: "ES" },
+    { code: "fr", label: "French (France Speaker)", supportsMelo: true, defaultSpeakerId: "FR" },
+    { code: "zh", label: "Chinese (Mandarin Speaker)", supportsMelo: true, defaultSpeakerId: "ZH" },
+    { code: "ja", label: "Japanese (Japan Speaker)", supportsMelo: true, defaultSpeakerId: "JP" },
+    { code: "ko", label: "Korean (Korea Speaker)", supportsMelo: true, defaultSpeakerId: "KR" },
+    { code: "de", label: "German", supportsMelo: false },
+    { code: "pt", label: "Portuguese", supportsMelo: false },
+  ],
+  ttsModes: [
+    { value: "qwen3", label: "Qwen3-TTS" },
+    { value: "melo", label: "MeloTTS" },
+    { value: "gtts", label: "gTTS" },
+  ],
+  qwen3ModelSizes: ["0.6B", "1.7B"],
+  meloSpeakerIdsByLanguage: {
+    en: ["EN-US", "EN-BR", "EN_INDIA", "EN-AU", "EN-Default"],
+    es: ["ES"],
+    fr: ["FR"],
+    zh: ["ZH"],
+    ja: ["JP"],
+    ko: ["KR"],
+  },
+  defaults: {
+    ttsMode: "qwen3",
+    qwen3ModelSize: "1.7B",
+    enableVoiceCloning: true,
+  },
+};
+
+function encodePathForRoute(path: string): string {
+  return path.replace(/\\/g, "/").split("/").map(encodeURIComponent).join("/");
+}
+
+function buildWsUrl(params: {
+  filePath: string;
+  targetLanguage: string;
+  ttsMode: "melo" | "qwen3" | "gtts";
+  qwen3ModelSize: string;
+  speakerId: string;
+  enableVoiceCloning: boolean;
+}): string {
+  const encodedPath = encodePathForRoute(params.filePath);
+  const url = new URL(`${WS_BASE_URL}/translate/${encodedPath}/${encodeURIComponent(params.targetLanguage)}`);
+  url.searchParams.set("tts_mode", params.ttsMode);
+  url.searchParams.set("qwen3_model_size", params.qwen3ModelSize);
+  url.searchParams.set("enable_voice_cloning", String(params.enableVoiceCloning));
+  if (params.speakerId.trim()) {
+    url.searchParams.set("speaker_id", params.speakerId.trim());
+  }
+  return url.toString();
+}
+
+export default function Home() {
+  const { toast } = useToast();
+
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [videoPath, setVideoPath] = useState("");
+
+  const [options, setOptions] = useState<OptionsResponse>(FALLBACK_OPTIONS);
+  const [targetLanguage, setTargetLanguage] = useState("");
+  const [ttsMode, setTtsMode] = useState<"melo" | "qwen3" | "gtts">("qwen3");
+  const [qwen3ModelSize, setQwen3ModelSize] = useState("1.7B");
+  const [enableVoiceCloning, setEnableVoiceCloning] = useState(true);
+  const [meloSpeakerId, setMeloSpeakerId] = useState("");
+
+  const [isLoadingOptions, setIsLoadingOptions] = useState(true);
+  const [isTranslating, setIsTranslating] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [status, setStatus] = useState("Ready.");
+  const [translatedVideoPath, setTranslatedVideoPath] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+
+    const loadOptions = async () => {
+      setIsLoadingOptions(true);
+      try {
+        const response = await fetch(`${API_BASE_URL}/options`);
+        if (!response.ok) {
+          throw new Error(`Options request failed (${response.status})`);
+        }
+        const data = (await response.json()) as OptionsResponse;
+        if (!active) {
+          return;
+        }
+
+        setOptions(data);
+        setTargetLanguage((prev) => prev || data.languages[0]?.code || "");
+        setTtsMode(data.defaults?.ttsMode || "qwen3");
+        setQwen3ModelSize(data.defaults?.qwen3ModelSize || "1.7B");
+        setEnableVoiceCloning(data.defaults?.enableVoiceCloning ?? true);
+      } catch {
+        if (!active) {
+          return;
+        }
+        setOptions(FALLBACK_OPTIONS);
+        setTargetLanguage((prev) => prev || FALLBACK_OPTIONS.languages[0]?.code || "");
+        toast({
+          title: "Backend options unavailable",
+          description: "Using local fallback settings. Check that the backend is running.",
+          variant: "destructive",
+        });
+      } finally {
+        if (active) {
+          setIsLoadingOptions(false);
+        }
+      }
+    };
+
+    loadOptions();
+
+    return () => {
+      active = false;
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
+    };
+  }, [toast]);
+
+  useEffect(() => {
+    if (!targetLanguage) {
+      return;
     }
+    const selectedLang = options.languages.find((language) => language.code === targetLanguage);
+    if (!selectedLang) {
+      return;
+    }
+
+    setMeloSpeakerId((previous) => previous || selectedLang.defaultSpeakerId || "");
+  }, [targetLanguage, options.languages]);
+
+  const meloSpeakersForLanguage = useMemo(() => {
+    if (!targetLanguage) {
+      return [];
+    }
+    return options.meloSpeakerIdsByLanguage[targetLanguage] || [];
+  }, [options.meloSpeakerIdsByLanguage, targetLanguage]);
+
+  const outputDownloadUrl = useMemo(() => {
+    if (!translatedVideoPath) {
+      return null;
+    }
+    return `${API_BASE_URL}/files/${encodePathForRoute(translatedVideoPath)}`;
+  }, [translatedVideoPath]);
+
+  const handleFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
+    setSelectedFile(file);
+    setVideoPath(file.name);
+    setTranslatedVideoPath(null);
+    setProgress(0);
+    setStatus("Ready to translate.");
   };
 
   const handleTranslate = async () => {
     if (!selectedFile || !targetLanguage) {
       toast({
-        title: "Error",
-        description: "Please select a video file and target language.",
+        title: "Missing input",
+        description: "Choose a video file and target language before starting.",
         variant: "destructive",
       });
       return;
     }
 
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+
     setIsTranslating(true);
-    setProgress(0);
-    setStatus("Uploading and translating...");
+    setProgress(4);
+    setStatus("Uploading file...");
+    setTranslatedVideoPath(null);
 
     try {
-      // Upload the file
       const formData = new FormData();
-      formData.append('file', selectedFile);
+      formData.append("file", selectedFile);
 
-      const uploadResponse = await fetch('http://localhost:8000/upload', {
-        method: 'POST',
+      const uploadResponse = await fetch(`${API_BASE_URL}/upload`, {
+        method: "POST",
         body: formData,
       });
-      const uploadData = await uploadResponse.json();
-      const filePath = uploadData.filePath; // This should be relative path e.g., "uploaded_files/video.mp4"
 
-      // The WebSocket URL now expects the video_path to be part of the URL path.
-      // FastAPI automatically decodes URL parameters, so no need for double encoding if filePath is simple.
-      // However, if filePath can contain special characters like '/' (which it will),
-      // it needs to be properly encoded for the URL path segment.
-      // The server-side uses `:path` converter for `video_path`, which handles slashes.
-      // Normalize path separators to forward slashes before splitting and encoding
-      const pathSegments = filePath.replace(/\\/g, '/').split('/');
-      const encodedFilePath = pathSegments.map(encodeURIComponent).join('/');
+      if (!uploadResponse.ok) {
+        const text = await uploadResponse.text();
+        throw new Error(text || `Upload failed (${uploadResponse.status})`);
+      }
 
-      const ws = new WebSocket(
-        `ws://localhost:8000/translate/${encodedFilePath}/${targetLanguage}`
-      );
+      const uploadData = (await uploadResponse.json()) as { filePath?: string };
+      if (!uploadData.filePath) {
+        throw new Error("Upload completed but file path was missing in server response.");
+      }
+
+      setStatus("Connecting to translation server...");
+      setProgress(12);
+
+      const wsUrl = buildWsUrl({
+        filePath: uploadData.filePath,
+        targetLanguage,
+        ttsMode,
+        qwen3ModelSize,
+        speakerId: ttsMode === "melo" ? meloSpeakerId : "",
+        enableVoiceCloning: ttsMode === "qwen3" ? enableVoiceCloning : false,
+      });
+
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      let hasError = false;
+      let completed = false;
 
       ws.onopen = () => {
-        setStatus("Connection established. Starting translation...");
-        setProgress(10); // Initial progress
+        setStatus("Connected. Translation started.");
+        setProgress(18);
       };
 
       ws.onmessage = (event) => {
-        const message = event.data as string; // Type assertion
+        const message = String(event.data || "");
         setStatus(message);
 
-        // Simplified progress based on backend messages
         if (message.startsWith("Error:")) {
-          setProgress(0); // Reset progress on error
+          hasError = true;
+          setProgress(0);
+          setIsTranslating(false);
           toast({
-            title: "Translation Error",
+            title: "Translation failed",
             description: message,
             variant: "destructive",
           });
-          setIsTranslating(false); // Stop loading state on error
-        } else if (message.includes("Video processing in progress...")) {
-          setProgress(30); // General progress update
-        } else if (message.includes("Translation complete. Output video:")) {
+          return;
+        }
+
+        if (message.includes("Translation complete. Output video:")) {
+          completed = true;
           setProgress(100);
-          const outputPath = message.split("Output video: ")[1];
-          setTranslatedVideoUrl(outputPath); // This path is relative to project root
-          toast({ // Success toast moved here from onclose for clarity
-            title: "Translation Successful!",
-            description: `Video translated. Output: ${outputPath}`,
+          setIsTranslating(false);
+          const outputPath = message.split("Output video: ")[1]?.trim();
+          if (outputPath) {
+            setTranslatedVideoPath(outputPath);
+          }
+          toast({
+            title: "Translation complete",
+            description: "Your translated video is ready.",
           });
-        } else {
-          // For other messages, you might increment progress or just display status
-           if (progress < 90) setProgress((prev: number) => Math.min(prev + 5, 90)); // Gradual progress for other messages
+          return;
         }
+
+        if (message.includes("Video processing in progress")) {
+          setProgress((prev) => Math.max(prev, 35));
+          return;
+        }
+
+        setProgress((prev) => Math.min(prev + 6, 92));
       };
 
-      ws.onclose = (event) => {
-        // Only set isTranslating to false if it wasn't an error case that already did it
-        if (!event.wasClean && !status.startsWith("Error:")) {
-            // If connection closed uncleanly and not due to a reported error
-            setStatus("Connection closed unexpectedly.");
-            toast({
-                title: "Connection Issue",
-                description: "The connection to the server was lost.",
-                variant: "destructive",
-            });
-        } else if (event.wasClean && progress !== 100 && !status.startsWith("Error:")) {
-            // If connection closed cleanly but process didn't complete fully (e.g. server closed it early)
-             setStatus("Translation process ended.");
-        }
-        // If translation was successful, isTranslating is already false from onmessage.
-        // If there was an error, isTranslating is also set to false.
-        // This ensures the button re-enables correctly.
-        if (progress !== 100) { // If not completed successfully
-            setIsTranslating(false);
-        }
-      };
-
-      ws.onerror = (errorEvent) => { // errorEvent is of type Event
+      ws.onerror = () => {
+        hasError = true;
         setIsTranslating(false);
-        setStatus("Error occurred");
+        setStatus("Connection error while translating.");
         toast({
-          title: "Error",
-          description: "An error occurred during translation.",
+          title: "WebSocket error",
+          description: "Could not keep the translation connection open.",
           variant: "destructive",
         });
       };
+
+      ws.onclose = (closeEvent) => {
+        wsRef.current = null;
+
+        if (completed || hasError) {
+          return;
+        }
+
+        setIsTranslating(false);
+        if (!closeEvent.wasClean) {
+          setStatus("Connection closed unexpectedly.");
+          toast({
+            title: "Connection interrupted",
+            description: "The server connection dropped before completion.",
+            variant: "destructive",
+          });
+        } else {
+          setStatus("Translation session ended.");
+        }
+      };
     } catch (error) {
       setIsTranslating(false);
-      setStatus("Error occurred");
+      setStatus("Unable to start translation.");
       toast({
-        title: "Error",
-        description: (error as Error).message || "An error occurred during translation.", // Type assertion for error
+        title: "Request failed",
+        description: (error as Error).message,
         variant: "destructive",
       });
     }
   };
 
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center bg-gradient-to-b from-slate-50 to-slate-100">
-      <div className="w-full max-w-md p-8 bg-white rounded-lg shadow-lg">
-        <h1 className="text-3xl font-bold mb-6 text-slate-900">
-          Video Translator
-        </h1>
-        <div className="space-y-6">
-          <div>
-            <label
-              htmlFor="video-path"
-              className="block text-sm font-medium text-slate-700 mb-2"
-            >
-              Video File
+    <main className="studio-shell">
+      <section className="studio-card" aria-label="Video translation controls">
+        <header className="mb-8">
+          <p className="text-sm tracking-[0.22em] text-[#0f766e] uppercase">Open Source Pipeline</p>
+          <h1 className="mt-2 text-4xl font-bold leading-tight text-[#102a43]">Video Translator Studio</h1>
+          <p className="mt-3 max-w-2xl text-sm text-[#334e68]">
+            Upload a video, choose translation settings, and stream backend progress in real time.
+          </p>
+        </header>
+
+        <div className="grid gap-6 lg:grid-cols-2">
+          <div className="space-y-5">
+            <label htmlFor="video-path" className="field-label">
+              Source video
             </label>
-            <div className="flex">
+            <div className="flex gap-2">
               <Input
                 id="video-path"
                 type="text"
-                placeholder="/path/to/your/video.mp4"
                 value={videoPath}
                 readOnly
-                className="flex-grow mr-2"
+                aria-describedby="video-help"
+                placeholder="Select .mp4 / .mov / .mkv"
+                className="h-11 bg-white/80"
               />
               <Button
-                onClick={() => fileInputRef.current?.click()} // Optional chaining for ref
-                className="bg-slate-200 text-slate-700 hover:bg-slate-300"
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                aria-label="Choose video file"
+                className="h-11 bg-[#0f766e] px-4 text-white hover:bg-[#0e5f59]"
               >
-                <FolderOpen className="w-5 h-5" />
+                <FolderOpen className="h-5 w-5" />
               </Button>
               <input
-                type="file"
                 ref={fileInputRef}
-                onChange={handleFileSelect}
+                type="file"
                 accept="video/*"
                 className="hidden"
+                onChange={handleFileSelect}
               />
             </div>
-          </div>
-          <div>
-            <label
-              htmlFor="target-language"
-              className="block text-sm font-medium text-slate-700 mb-2"
-            >
-              Target Language
+            <p id="video-help" className="text-xs text-[#486581]">
+              Files are uploaded to the backend workspace before translation starts.
+            </p>
+
+            <label htmlFor="target-language" className="field-label">
+              Target language
             </label>
-            <Select onValueChange={setTargetLanguage}>
-              <SelectTrigger id="target-language" className="w-full">
-                <SelectValue placeholder="Select language" />
+            <Select value={targetLanguage} onValueChange={setTargetLanguage} disabled={isLoadingOptions || isTranslating}>
+              <SelectTrigger id="target-language" className="h-11 bg-white/80">
+                <SelectValue placeholder="Select target language" />
               </SelectTrigger>
               <SelectContent>
-                {Object.entries(LANGUAGE_MODEL_MAP).map(([code, language]) => (
-                  <SelectItem key={code} value={code}>
-                    {language}
+                {options.languages.map((language) => (
+                  <SelectItem key={language.code} value={language.code}>
+                    {language.label}
                   </SelectItem>
                 ))}
               </SelectContent>
             </Select>
           </div>
+
+          <div className="space-y-5">
+            <label htmlFor="tts-mode" className="field-label">
+              TTS engine
+            </label>
+            <Select
+              value={ttsMode}
+              onValueChange={(value) => setTtsMode(value as "melo" | "qwen3" | "gtts")}
+              disabled={isLoadingOptions || isTranslating}
+            >
+              <SelectTrigger id="tts-mode" className="h-11 bg-white/80">
+                <SelectValue placeholder="Select TTS mode" />
+              </SelectTrigger>
+              <SelectContent>
+                {options.ttsModes.map((mode) => (
+                  <SelectItem key={mode.value} value={mode.value}>
+                    {mode.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+
+            {ttsMode === "melo" && (
+              <>
+                <label htmlFor="melo-speaker" className="field-label">
+                  Melo speaker
+                </label>
+                <Select
+                  value={meloSpeakerId || "auto"}
+                  onValueChange={(value) => setMeloSpeakerId(value === "auto" ? "" : value)}
+                  disabled={isTranslating || meloSpeakersForLanguage.length === 0}
+                >
+                  <SelectTrigger id="melo-speaker" className="h-11 bg-white/80">
+                    <SelectValue placeholder="Auto speaker" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="auto">Auto (language default)</SelectItem>
+                    {meloSpeakersForLanguage.map((speaker) => (
+                      <SelectItem key={speaker} value={speaker}>
+                        {speaker}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {meloSpeakersForLanguage.length === 0 && (
+                  <p className="text-xs text-amber-700">
+                    Melo is unavailable for this target language. Backend will fall back to gTTS.
+                  </p>
+                )}
+              </>
+            )}
+
+            {ttsMode === "qwen3" && (
+              <>
+                <label htmlFor="qwen-size" className="field-label">
+                  Qwen3 model size
+                </label>
+                <Select
+                  value={qwen3ModelSize}
+                  onValueChange={setQwen3ModelSize}
+                  disabled={isTranslating}
+                >
+                  <SelectTrigger id="qwen-size" className="h-11 bg-white/80">
+                    <SelectValue placeholder="Select model size" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {options.qwen3ModelSizes.map((size) => (
+                      <SelectItem key={size} value={size}>
+                        {size}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+
+                <label className="mt-1 flex cursor-pointer items-center gap-3 rounded-md border border-[#bcccdc] bg-white/70 px-3 py-2 text-sm text-[#243b53]">
+                  <input
+                    type="checkbox"
+                    checked={enableVoiceCloning}
+                    onChange={(event) => setEnableVoiceCloning(event.target.checked)}
+                    disabled={isTranslating}
+                    className="h-4 w-4 rounded border-[#829ab1]"
+                  />
+                  Enable voice cloning reference extraction
+                </label>
+              </>
+            )}
+          </div>
+        </div>
+
+        <div className="mt-8 flex flex-wrap gap-3">
           <Button
+            type="button"
             onClick={handleTranslate}
-            disabled={isTranslating}
-            className="w-full bg-slate-800 text-white hover:bg-slate-700 transition-colors duration-200"
+            disabled={isTranslating || isLoadingOptions || !selectedFile || !targetLanguage}
+            className="h-11 bg-[#102a43] px-5 text-white hover:bg-[#0b1f33]"
           >
             {isTranslating ? (
               <>
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                Translating...
+                Translating
               </>
             ) : (
-              "Translate"
+              <>
+                <Sparkles className="mr-2 h-4 w-4" />
+                Start translation
+              </>
             )}
           </Button>
+
+          <a
+            href="https://github.com/Felixdiamond/videoTranslator"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex h-11 items-center gap-2 rounded-md border border-[#9fb3c8] bg-white/70 px-4 text-sm text-[#102a43] transition-colors hover:bg-white"
+          >
+            <Globe2 className="h-4 w-4" />
+            Project repository
+          </a>
         </div>
-        {isTranslating && (
-          <div className="mt-8 space-y-4">
-            <Progress value={progress} className="w-full h-2" />
-            <p className="text-center text-sm text-slate-600">{status}</p>
+
+        <section className="mt-8 rounded-lg border border-[#d9e2ec] bg-white/70 p-4" aria-live="polite" aria-atomic="true">
+          <div className="mb-3 flex items-center gap-2 text-sm font-medium text-[#243b53]">
+            <WandSparkles className="h-4 w-4" />
+            Live status
           </div>
+          <Progress value={progress} className="h-2 bg-[#d9e2ec]" />
+          <p className="mt-3 text-sm text-[#334e68]" role="status">
+            {status}
+          </p>
+        </section>
+
+        {translatedVideoPath && (
+          <section className="mt-6 rounded-lg border border-emerald-300 bg-emerald-50 p-4">
+            <p className="text-sm font-semibold text-emerald-900">Translation complete</p>
+            <p className="mt-2 break-all text-xs text-emerald-900/90">{translatedVideoPath}</p>
+            {outputDownloadUrl && (
+              <a
+                href={outputDownloadUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="mt-3 inline-flex items-center rounded-md bg-emerald-700 px-3 py-2 text-sm text-white hover:bg-emerald-600"
+              >
+                Download translated video
+              </a>
+            )}
+          </section>
         )}
-        {translatedVideoUrl && (
-          <div className="mt-8">
-            <p className="text-sm text-slate-600 mb-2">
-              Translated video saved at:
-            </p>
-            <p className="text-sm font-medium text-slate-900 break-all">
-              {translatedVideoUrl}
-            </p>
-          </div>
-        )}
-      </div>
-      <span className="text-center absolute bottom-3">
-        Made with ❤️ by{" "}
-        <a
-          href="https://github.com/Felixdiamond"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="text-slate-800 underline"
-        >
-          Felix
-        </a>
-      </span>
-    </div>
+      </section>
+    </main>
   );
 }

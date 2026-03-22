@@ -5,12 +5,8 @@ import torch
 import logging
 from accelerate import Accelerator
 
-# Attempt to import a project-specific config if it exists, otherwise use defaults.
-# This try-except block is designed to be flexible.
+# Optional project config override.
 try:
-    # Assuming 'config' is a module or an object that can be imported
-    # and has a .get() method similar to a config parser.
-    # For this project, we'll assume it's not present and defaults will be used.
     from config import config as project_specific_config
 except ImportError:
     project_specific_config = None
@@ -28,7 +24,6 @@ class GPUOptimizer:
             self.gradient_checkpointing = project_specific_config.get("gpu", "gradient_checkpointing", fallback=gradient_checkpointing)
             self.compile_mode = project_specific_config.get("gpu", "compile_mode", fallback="reduce-overhead")
         else:
-            # Defaults if config.py is not found or 'config' object is not in it
             self.mixed_precision = mixed_precision
             self.gradient_checkpointing = gradient_checkpointing
             self.compile_mode = "reduce-overhead"
@@ -41,7 +36,6 @@ class GPUOptimizer:
         """
         Initialize GPU settings and accelerator.
         """
-        # Initialize accelerator with mixed precision
         self.accelerator = Accelerator(
             mixed_precision=self.mixed_precision,
             gradient_accumulation_steps=1,
@@ -50,13 +44,11 @@ class GPUOptimizer:
         
         self.device = self.accelerator.device
         
-        # Set optimal PyTorch settings for performance
         if torch.cuda.is_available():
             torch.backends.cudnn.benchmark = True
-            torch.backends.cuda.matmul.allow_tf32 = True # For Ampere and newer
-            torch.backends.cudnn.allow_tf32 = True      # For Ampere and newer
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
             
-            # Print GPU information
             for i in range(torch.cuda.device_count()):
                 gpu_props = torch.cuda.get_device_properties(i)
                 memory_gb = gpu_props.total_memory / 1024**3
@@ -71,18 +63,16 @@ class GPUOptimizer:
         """
         compile_mode_to_use = compile_mode or self.compile_mode
         
-        # Move model to device using accelerator
         model = self.accelerator.prepare(model)
         
-        # Enable gradient checkpointing if supported
         if self.gradient_checkpointing and hasattr(model, 'gradient_checkpointing_enable'):
-            try: # Some models might not actually support it even if the method exists
+            try:
                 model.gradient_checkpointing_enable()
                 logging.info("Gradient checkpointing enabled")
             except Exception as e:
                 logging.warning(f"Could not enable gradient checkpointing: {e}")
 
-        # Apply torch.compile for potential speed boost (PyTorch 2.0+)
+        # Apply torch.compile when available.
         if hasattr(torch, 'compile') and torch.cuda.is_available() and self.device.type == 'cuda':
             logging.info(f"Applying torch.compile with mode: {compile_mode_to_use}")
             try:
@@ -96,14 +86,14 @@ class GPUOptimizer:
         """Get current GPU memory usage."""
         if torch.cuda.is_available():
             allocated = torch.cuda.memory_allocated(self.device) / 1024**3
-            reserved = torch.cuda.memory_reserved(self.device) / 1024**3 # PyTorch uses 'reserved' for 'cached'
+            reserved = torch.cuda.memory_reserved(self.device) / 1024**3
             total_memory = torch.cuda.get_device_properties(self.device).total_memory / 1024**3
             
             return {
                 'allocated_gb': allocated,
-                'reserved_gb': reserved, # Using 'reserved' as it's what PyTorch provides
+                'reserved_gb': reserved,
                 'total_gb': total_memory,
-                'free_approx_gb': total_memory - reserved # Free is total - reserved (cached)
+                'free_approx_gb': total_memory - reserved
             }
         return None
 
@@ -124,6 +114,23 @@ class GPUOptimizer:
                 f"Total: {memory_info['total_gb']:.2f}GB"
             )
 
-# Global GPU optimizer instance
-# This will be initialized when the module is imported.
+# Global GPU optimizer instance.
 gpu_optimizer = GPUOptimizer()
+
+
+def detect_hardware_tier() -> str:
+    """
+    Returns one of: 'cpu_low', 'cpu_high', 'gpu_low', 'gpu_medium', 'gpu_high'.
+    Used to select appropriately-sized models for the available hardware.
+    """
+    import psutil
+    if not torch.cuda.is_available():
+        ram_gb = psutil.virtual_memory().total / 1024 ** 3
+        return "cpu_high" if ram_gb >= 16 else "cpu_low"
+
+    vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+    if vram_gb < 6:
+        return "gpu_low"
+    if vram_gb < 12:
+        return "gpu_medium"
+    return "gpu_high"

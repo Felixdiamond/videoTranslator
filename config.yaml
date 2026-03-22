@@ -1,0 +1,25 @@
+# Optional runtime overrides.
+
+# auto | cpu_low | cpu_high | gpu_low | gpu_medium | gpu_high
+hardware_tier: auto
+
+# base | small | medium | large-v3 | large-v3-turbo
+whisper_model: null
+
+# facebook/nllb-200-distilled-600M | facebook/nllb-200-1.3B | facebook/nllb-200-3.3B
+translation_model: null
+
+# qwen3 | melo | gtts
+tts_mode: qwen3
+
+# Used only when tts_mode: qwen3. Values: 0.6B | 1.7B
+qwen3_model_size: "1.7B"
+
+# Used only when tts_mode: qwen3.
+enable_voice_cloning: true
+
+# Used only when tts_mode: melo.
+melo_speaker_id: null
+
+# htdemucs | htdemucs_ft | htdemucs_6s | hdemucs_mmi
+demucs_model: null

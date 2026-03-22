@@ -5,17 +5,12 @@ import time
 import psutil
 import logging
 from contextlib import contextmanager
-import functools
 
-# Attempt to import gpu_optimizer from the gpu_config module.
-# This assumes gpu_config.py is in the same directory or Python path.
+# Prefer project GPU optimizer; fallback to a no-op shim.
 try:
     from gpu_config import gpu_optimizer
 except ImportError:
-    # Fallback if gpu_optimizer cannot be imported (e.g., running standalone or in a different setup)
     logging.warning("gpu_optimizer could not be imported from gpu_config. GPU status logging will be limited.")
-    # Create a mock gpu_optimizer if it's critical for the class structure,
-    # or handle its absence gracefully in methods.
     class MockGPUOptimizer:
         def log_gpu_status(self):
             logging.debug("MockGPUOptimizer: log_gpu_status called (GPU info not available).")
@@ -41,7 +36,7 @@ class PerformanceMonitor:
         start_memory_mb = self._get_memory_usage_mb()
         
         logging.info(f"Starting {operation_name}...")
-        if gpu_optimizer: # Check if gpu_optimizer is available
+        if gpu_optimizer:
             gpu_optimizer.log_gpu_status() 
         
         try:
@@ -51,7 +46,6 @@ class PerformanceMonitor:
             end_memory_mb = self._get_memory_usage_mb()
             
             duration_s = end_time - start_time
-            # Ensure memory values are not None before subtraction
             memory_delta_mb = (end_memory_mb - start_memory_mb) if end_memory_mb is not None and start_memory_mb is not None else 0.0
             
             self.metrics[operation_name] = {
@@ -62,7 +56,7 @@ class PerformanceMonitor:
             }
             
             logging.info(f"Completed {operation_name} in {duration_s:.2f}s (RAM Δ: {memory_delta_mb:+.1f}MB)")
-            if gpu_optimizer: # Check if gpu_optimizer is available
+            if gpu_optimizer:
                 gpu_optimizer.log_gpu_status()
 
     def _get_memory_usage_mb(self):
@@ -76,7 +70,7 @@ class PerformanceMonitor:
 
     def log_gpu_status_direct(self):
         """Log current GPU memory status using gpu_optimizer."""
-        if gpu_optimizer: # Check if gpu_optimizer is available
+        if gpu_optimizer:
             gpu_optimizer.log_gpu_status()
 
     def get_summary(self):
@@ -85,7 +79,7 @@ class PerformanceMonitor:
             return "No performance data collected."
         
         total_time_s = sum(m['duration_s'] for m in self.metrics.values())
-        # Net memory change is the sum of deltas. Peak usage would require tracking max end_memory_mb.
+        # Net memory change across all timed operations.
         net_memory_change_mb = sum(m['memory_delta_mb'] for m in self.metrics.values())
         
         summary = f"\n{'='*50}\n"
@@ -104,6 +98,5 @@ class PerformanceMonitor:
         summary += f"{'='*50}\n"
         return summary
 
-# Global performance monitor instance
-# This will be initialized when the module is imported.
+# Global monitor instance.
 performance_monitor = PerformanceMonitor()

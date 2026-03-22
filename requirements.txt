@@ -1,38 +1,44 @@
-# Core ML/AI Libraries
-torch # For GPU support, user might need to install a specific CUDA version:
-# e.g., pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+# ── torch triplet ─────────────────────────────────────────────────────────────
+# Install all three together from the same index URL to avoid ABI mismatches.
+# CUDA 12.1:  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# CUDA 11.8:  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+# CPU-only:   pip install torch torchvision torchaudio
+# Kaggle:     do NOT install these — see kaggle_run.ipynb Cell 2.
+torch
 torchvision
 torchaudio
-transformers # For translation and summarization models
-accelerate # For GPU optimization and mixed precision
-openai-whisper # For transcription
 
-# Audio Processing
+# ML / Transcription
+transformers>=4.40.0
+accelerate
+faster-whisper>=1.2.1
+whisperx>=3.8.2
+
+# Audio
 librosa
 soundfile
 pydub
-noisereduce # For noise reduction
+noisereduce
+pyrubberband>=0.3.0  # requires: apt-get install rubberband-cli
+demucs>=4.0.1
 
-# Text-to-Speech
-gtts # Google Text-to-Speech (fallback)
-# MeloTTS is installed separately, see README.md for instructions.
-# unidic is also installed separately for Japanese support in MeloTTS.
+# TTS
+gtts
+# MeloTTS: pip install git+https://github.com/Felixdiamond/MeloTTS.git
+# Qwen3-TTS: pip install git+https://github.com/QwenLM/Qwen3-TTS.git
 
-# Video Processing
-moviepy
+# Video
+moviepy>=2.2.0
 
-# Web Server & API
+# Web server
 fastapi
-uvicorn[standard] # Includes websockets and other standard dependencies
-# websockets # Now included with uvicorn[standard]
+uvicorn[standard]
 
 # Utilities
-tqdm # Progress bars
-psutil # For system performance monitoring
-sentencepiece # Dependency for some Hugging Face tokenizers
-sacremoses # Dependency for some Hugging Face tokenizers
+tqdm
+psutil
+pyyaml
+sentencepiece
+sacremoses
 numpy
-
-# Note: TTS (from Coqui TTS) was previously listed but the new script uses MeloTTS or gTTS.
-# If Coqui TTS is still desired as an option, it would need to be re-added.
-# The new script does not import from 'TTS.utils' anymore.
+setuptools<=81
