@@ -1,24 +1,4 @@
-"""
-tts_engine.py — Unified TTS interface
-
-Supports:
-  - MeloTTS    (fast, preset voices, multi-speaker)
-  - Qwen3-TTS  (voice cloning, high-quality, 10 languages)
-  - gTTS       (network-based fallback; no local GPU needed)
-
-Usage (context-manager — auto-unloads VRAM):
-
-    with TTSEngine(mode="qwen3", device="cuda", model_size="1.7B") as tts:
-        tts.extract_voice_embedding("voice_reference.wav", ref_text)
-        tts.synthesize("Hello", "en", "/tmp/out.wav")
-
-Usage (manual lifecycle):
-
-    tts = TTSEngine(mode="melo", device="cuda")
-    tts.load_melo("EN")
-    tts.synthesize("Hello", "en", "/tmp/out.wav")
-    tts.unload()
-"""
+"""Unified TTS engine for MeloTTS, Qwen3-TTS, and gTTS fallback."""
 
 import gc
 import logging
@@ -28,10 +8,6 @@ import torch
 from gtts import gTTS
 from pydub import AudioSegment
 
-# ---------------------------------------------------------------------------
-# Optional heavy-dependency imports — fail gracefully so the rest of the
-# system can run even when a specific TTS backend isn't installed.
-# ---------------------------------------------------------------------------
 try:
     from melo.api import TTS as MeloTTS_API
     _MELO_AVAILABLE = True
@@ -62,13 +38,6 @@ except ImportError:
     sf = None
     _SF_AVAILABLE = False
 
-# ---------------------------------------------------------------------------
-# Speaker registry
-# ---------------------------------------------------------------------------
-
-# Default generation kwargs for Qwen3-TTS.
-# Without do_sample=True the model uses greedy decoding which produces flat,
-# monotonic, robotic speech. These match the values from official examples.
 _QWEN_GEN_DEFAULTS: dict = dict(
     max_new_tokens=2048,
     do_sample=True,
@@ -78,9 +47,6 @@ _QWEN_GEN_DEFAULTS: dict = dict(
     repetition_penalty=1.05,
 )
 
-#: All known MeloTTS speaker IDs per language code.
-#: DE and PT are intentionally absent — MeloTTS has no model/config for them.
-#: Requests for those languages are routed to gTTS automatically.
 MELO_ALL_SPEAKERS: Dict[str, list] = {
     "en": ["EN-US", "EN-BR", "EN_INDIA", "EN-AU", "EN-Default"],
     "es": ["ES"],
@@ -92,16 +58,7 @@ MELO_ALL_SPEAKERS: Dict[str, list] = {
 
 
 def get_all_speaker_ids(melo_instance) -> Dict[str, int]:
-    """Return all speaker IDs available in a loaded MeloTTS instance.
-
-    Args:
-        melo_instance: A loaded ``MeloTTS_API`` object, or ``None``.
-
-    Returns:
-        ``dict`` mapping speaker-id string → integer index,
-        e.g. ``{"EN-US": 0, "EN-BR": 1, ...}``.
-        Returns an empty dict when *melo_instance* is ``None``.
-    """
+    """Return speaker IDs for the active MeloTTS model."""
     if melo_instance is None:
         return {}
     try:
@@ -110,25 +67,8 @@ def get_all_speaker_ids(melo_instance) -> Dict[str, int]:
         return {}
 
 
-# ---------------------------------------------------------------------------
-# TTSEngine
-# ---------------------------------------------------------------------------
-
 class TTSEngine:
-    """Unified TTS interface supporting MeloTTS and Qwen3-TTS with gTTS fallback.
-
-    Parameters
-    ----------
-    mode : str
-        Primary synthesis backend: ``"melo"`` | ``"qwen3"`` | ``"gtts"``.
-    device : str
-        PyTorch device string, e.g. ``"cuda"`` or ``"cpu"``.
-    model_size : str
-        Qwen3-TTS model size when ``mode="qwen3"``: ``"0.6B"`` or ``"1.7B"``.
-    language_model_map : dict, optional
-        The ``LANGUAGE_MODEL_MAP`` dict from ``translator.py``, used to look up
-        default MeloTTS speaker IDs and gTTS language codes.
-    """
+    """Unified TTS interface with backend routing and lifecycle helpers."""
 
     def __init__(
         self,
@@ -148,17 +88,8 @@ class TTSEngine:
         self._qwen_variant: Optional[str] = None  # "Base" | "CustomVoice"
         self._reference_embedding = None   # pre-computed voice-clone embedding
 
-    # ------------------------------------------------------------------
-    # Model loading
-    # ------------------------------------------------------------------
-
     def load_melo(self, language: str) -> None:
-        """Load (or hot-reload) MeloTTS for *language* (e.g. ``"EN"``, ``"FR"``).
-
-        No-op when the requested language is already loaded. Re-loads and frees
-        the old model when the language changes (prevents wrong-language
-        phonemes when target language changes between calls).
-        """
+        """Load or hot-reload MeloTTS for the requested language."""
         if not _MELO_AVAILABLE:
             logging.warning("TTSEngine: MeloTTS unavailable — skipping load.")
             return
@@ -179,12 +110,7 @@ class TTSEngine:
         )
 
     def load_qwen3(self, for_voice_cloning: bool = False) -> None:
-        """Load Qwen3-TTS from HuggingFace Hub.
-
-        Args:
-            for_voice_cloning: When ``True``, load the ``Base`` checkpoint
-                required for high-fidelity cloning. Otherwise load ``CustomVoice``.
-        """
+        """Load Qwen3-TTS from HuggingFace Hub."""
         if not _QWEN3_AVAILABLE:
             logging.warning("TTSEngine: Qwen3-TTS unavailable — skipping load.")
             return
@@ -203,8 +129,6 @@ class TTSEngine:
         logging.info(
             f"TTSEngine: loading Qwen3-TTS '{model_id}' on device='{device_str}' with dtype='{dtype}'"
         )
-        # Flash Attention 2 significantly reduces VRAM and speeds up inference.
-        # Requires: pip install flash-attn
         extra_kwargs: dict = {}
         if device_str.startswith("cuda"):
             try:
@@ -225,27 +149,10 @@ class TTSEngine:
         self._qwen_variant = variant
         logging.info("TTSEngine: Qwen3-TTS ready.")
 
-    # ------------------------------------------------------------------
-    # Voice cloning helpers
-    # ------------------------------------------------------------------
-
     def extract_voice_embedding(
         self, reference_audio_path: str, reference_text: str = ""
     ) -> bool:
-        """Pre-compute a speaker embedding from a 3–10 s reference clip.
-
-        The embedding is cached in ``self._reference_embedding`` and reused
-        by :meth:`synthesize` for every segment.
-
-        Args:
-            reference_audio_path: Path to a clean WAV clip of the speaker.
-            reference_text: Transcript of the reference clip (improves accuracy).
-
-        Returns:
-            ``True`` if the embedding was extracted, ``False`` if Qwen3-TTS is
-            not loaded (e.g. the package is not installed) — pipeline continues
-            without voice cloning in that case.
-        """
+        """Create and cache a voice embedding for cloning."""
         if self._qwen is None:
             logging.warning(
                 "TTSEngine: skipping voice-clone embedding — "
@@ -255,8 +162,6 @@ class TTSEngine:
         logging.info(
             f"TTSEngine: extracting voice embedding from '{reference_audio_path}'"
         )
-        # ICL mode (x_vector_only_mode=False) requires non-empty ref_text.
-        # Auto-switch to x-vector-only when no transcript is provided.
         use_icl = bool(reference_text and reference_text.strip())
         self._reference_embedding = self._qwen.create_voice_clone_prompt(
             ref_audio=reference_audio_path,
@@ -269,10 +174,6 @@ class TTSEngine:
         )
         return True
 
-    # ------------------------------------------------------------------
-    # Synthesis (unified interface)
-    # ------------------------------------------------------------------
-
     def synthesize(
         self,
         text: str,
@@ -282,25 +183,7 @@ class TTSEngine:
         speaker_id: Optional[str] = None,
         instruct: str = "",
     ) -> None:
-        """Synthesise *text* and write audio to *output_path*.
-
-        Routing logic:
-        - ``mode='qwen3'`` → Qwen3-TTS (voice-clone if embedding cached, preset otherwise).
-          Raises ``RuntimeError`` if the model is not loaded.
-        - ``mode='melo'`` with loaded model → MeloTTS using *speaker_id``
-          (auto-selects from config if *speaker_id* is ``None``).
-        - ``mode='gtts'`` → gTTS directly.
-        - MeloTTS failure → gTTS fallback.
-
-        Args:
-            text: Text to synthesise.
-            language_code: Short language code (``"en"``, ``"fr"`` …).
-            output_path: Destination WAV file path.
-            speed: TTS speed multiplier (MeloTTS only; ignored by Qwen3/gTTS).
-            speaker_id: Explicit MeloTTS speaker ID (e.g. ``"EN-BR"``).
-            instruct: Natural-language style instruction for Qwen3-TTS
-                      (e.g. ``"speak excitedly"``).
-        """
+                """Synthesize speech and write it to output_path."""
         if self.mode == "qwen3":
             if self._qwen is None:
                 raise RuntimeError(
@@ -312,10 +195,6 @@ class TTSEngine:
             self._synthesize_melo(text, language_code, output_path, speed, speaker_id)
         else:
             self._synthesize_gtts(text, language_code, output_path)
-
-    # ------------------------------------------------------------------
-    # Backend helpers (private)
-    # ------------------------------------------------------------------
 
     def _normalize_qwen_language(self, language_code: str) -> str:
         """Map short ISO-like language code to Qwen expected language names."""
@@ -346,7 +225,6 @@ class TTSEngine:
     ) -> None:
         qwen_language = self._normalize_qwen_language(language_code)
 
-        # Translate speed float into a natural language pace instruction
         if speed >= 1.3:
             pace_instruct = "speak quickly and clearly"
         elif speed <= 0.8:
@@ -354,14 +232,11 @@ class TTSEngine:
         else:
             pace_instruct = "speak at a natural pace"
 
-        # Merge with any caller-provided instruct
         combined_instruct = f"{pace_instruct}. {instruct}".strip(". ") if instruct else pace_instruct
 
         kwargs = dict(text=text, language=qwen_language)
         try:
             if self._reference_embedding is not None:
-                # generate_voice_clone does not accept instruct — style
-                # is controlled by the reference audio in ICL/x-vector mode.
                 if pace_instruct != "speak at a natural pace":
                     logging.info(
                         "[QWEN3_TTS] Pace instruction ignored for voice-clone (style "
@@ -403,7 +278,6 @@ class TTSEngine:
         speaker_id: Optional[str],
     ) -> None:
         spk2id = self._melo.hps.data.spk2id
-        # Determine speaker integer ID
         if speaker_id and speaker_id in spk2id:
             sid = spk2id[speaker_id]
         else:
@@ -436,20 +310,12 @@ class TTSEngine:
             )
             AudioSegment.silent(duration=100).export(output_path, format="wav")
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
     def get_speaker_ids(self) -> Dict[str, int]:
-        """Return the speaker-ID map from the currently loaded MeloTTS instance."""
+        """Return the active MeloTTS speaker-ID map."""
         return get_all_speaker_ids(self._melo)
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
     def unload(self) -> None:
-        """Delete all loaded models and release VRAM / RAM."""
+        """Unload all models and clear caches."""
         if self._melo is not None:
             del self._melo
             self._melo = None
@@ -468,4 +334,4 @@ class TTSEngine:
 
     def __exit__(self, *args) -> bool:
         self.unload()
-        return False   # do not suppress exceptions
+        return False

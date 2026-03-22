@@ -4,21 +4,18 @@ from typing import Optional
 from pathlib import Path
 import shutil
 import logging
-import asyncio # Added for running blocking IO in a thread
+import asyncio
 
-# Import the main processing function and language map from the updated translator
 from translator import process_video, LANGUAGE_MODEL_MAP
 
 app = FastAPI()
 
-# Configure basic logging for the server
-# translator.py now configures its own logger, so this will be for server-specific logs
+# Server logger setup.
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Allow CORS for specific origins
 origins = [
-    "http://localhost:3000", # Assuming your Next.js frontend runs on this port
+    "http://localhost:3000",
 ]
 
 app.add_middleware(
@@ -34,8 +31,8 @@ UPLOAD_DIRECTORY.mkdir(parents=True, exist_ok=True)
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
-    # Sanitize filename to prevent directory traversal or invalid characters
-    filename = Path(file.filename).name # Basic sanitization
+    # Basic filename sanitization.
+    filename = Path(file.filename).name
     if not filename:
         raise HTTPException(status_code=400, detail="Invalid filename.")
 
@@ -48,7 +45,7 @@ async def upload_file(file: UploadFile = File(...)):
         logger.error(f"Failed to save uploaded file '{filename}': {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Could not save file: {e}")
 
-    # Return the path relative to the project root, as expected by the frontend and translator.py
+    # Return a project-relative path.
     return {"filePath": str(file_location.relative_to(Path.cwd()))}
 
 

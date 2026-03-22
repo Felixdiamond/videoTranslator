@@ -15,31 +15,26 @@ import torchaudio
 from demucs.pretrained import get_model as demucs_get_model
 from demucs.apply import apply_model as demucs_apply_model
 from moviepy import VideoFileClip
-# CompositeAudioClip might not be directly used if pydub handles all composition
 from gtts import gTTS
 from pydub import AudioSegment, effects as pydub_effects # Renamed to avoid conflict
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from tqdm import tqdm
-# from pydub.playback import play # Not used in the new script's core logic
 
 import torch
 
 import yaml
 
-# Import from new local modules
 from gpu_config import gpu_optimizer, detect_hardware_tier
 from performance_monitor import performance_monitor
 
-# TTS engine — TTSEngine, MELO_ALL_SPEAKERS, get_all_speaker_ids are defined in tts_engine.py
 from tts_engine import TTSEngine
 
 
-# Set up logging
 log_dir = "logs"
 os.makedirs(log_dir, exist_ok=True)
 log_filepath = os.path.join(log_dir, "video_translator.log")
 
-# Remove existing handlers before adding new ones to prevent duplicate logs in notebooks
+# Reset root handlers to avoid duplicate logs.
 for handler in logging.root.handlers[:]:
     logging.root.removeHandler(handler)
 
@@ -53,9 +48,8 @@ logging.basicConfig(
 )
 logging.info("Logging system initialized for translator.py.")
 
-# --- Optional config.yaml override ---
 def _load_app_config(path: str = "config.yaml") -> dict:
-    """Load optional config.yaml.  Returns {} if the file is absent or invalid."""
+    """Load config.yaml, returning {} on failure."""
     try:
         with open(path, "r") as fh:
             return yaml.safe_load(fh) or {}
@@ -70,13 +64,10 @@ if APP_CONFIG:
     logging.info(f"Loaded config.yaml overrides: {APP_CONFIG}")
 
 
-# TTS engine lifecycle is managed per-call by TTSEngine (see tts_engine.py)
-
-# Use global GPU optimizer
+# Global GPU optimizer handles device and memory utilities.
 accelerator = gpu_optimizer.accelerator
 device = gpu_optimizer.device
 
-# --- Device announcement ---
 if device.type == "cuda":
     gpu_name = torch.cuda.get_device_name(device)
     vram_gb  = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
@@ -86,7 +77,6 @@ else:
     ram_gb = psutil.virtual_memory().total / (1024 ** 3)
     logging.info(f"[DEVICE] Running on CPU (no CUDA device found). System RAM: {ram_gb:.1f} GB")
 
-# Language mapping for MeloTTS and fallback gTTS language codes
 LANGUAGE_MODEL_MAP: Dict[str, Dict[str, str]] = {
     "en": {"melo_language": "EN", "speaker_id": "EN-US", "gtts_lang": "en"},
     "es": {"melo_language": "ES", "speaker_id": "ES", "gtts_lang": "es"},
@@ -94,8 +84,7 @@ LANGUAGE_MODEL_MAP: Dict[str, Dict[str, str]] = {
     "zh": {"melo_language": "ZH", "speaker_id": "ZH", "gtts_lang": "zh-CN"},
     "ja": {"melo_language": "JP", "speaker_id": "JP", "gtts_lang": "ja"},
     "ko": {"melo_language": "KR", "speaker_id": "KR", "gtts_lang": "ko"},
-    # DE and PT: gTTS-only — MeloTTS has no model for these languages.
-    # Do NOT add melo_language or speaker_id here; process_video gates on supported set.
+    # MeloTTS has no DE/PT model; route those to gTTS.
     "de": {"gtts_lang": "de"},
     "pt": {"gtts_lang": "pt"},
 }
@@ -104,7 +93,6 @@ DUCKING_GAIN_DB = -18  # How much to reduce original audio volume during transla
 CROSSFADE_MS = 50     # Crossfade duration for audio segments
 MIN_SEGMENT_MS = 800
 
-# --- Hardware-tiered Whisper model sizes ---
 WHISPER_MODEL_TIERS: Dict[str, str] = {
     "cpu_low":    "base",               # 74M params, CPU-friendly
     "cpu_high":   "small",              # 244M params
@@ -113,10 +101,7 @@ WHISPER_MODEL_TIERS: Dict[str, str] = {
     "gpu_high":   "large-v3",           # 1.54B params, max accuracy
 }
 
-# --- Empirical chars/sec per language at MeloTTS speed=1.0 ---
-# NOTE: These values should be re-calibrated after any MeloTTS update.
-# Run:  python calibrate_cps.py  and paste the output here.
-# Only MeloTTS-supported languages are listed. DE/PT use gTTS which has no speed control.
+# Re-run calibrate_cps.py after MeloTTS updates.
 CPS_MAP: Dict[str, float] = {
     "en": 13.8,
     "fr": 18.3,
@@ -126,7 +111,6 @@ CPS_MAP: Dict[str, float] = {
     "ko": 5.7,
 }
 
-# --- NLLB-200 translation model tiers ---
 TRANSLATION_MODEL_TIERS: Dict[str, Tuple[str, str, str]] = {
     "cpu_low":    ("facebook/nllb-200-distilled-600M", "cpu",  "float32"),
     "cpu_high":   ("facebook/nllb-200-1.3B",           "cpu",  "float32"),
@@ -135,7 +119,6 @@ TRANSLATION_MODEL_TIERS: Dict[str, Tuple[str, str, str]] = {
     "gpu_high":   ("facebook/nllb-200-3.3B",           "cuda", "float16"),
 }
 
-# NLLB-200 BCP-47 language codes
 NLLB_LANG_CODES: Dict[str, str] = {
     "en": "eng_Latn",
     "es": "spa_Latn",
@@ -152,7 +135,7 @@ NLLB_LANG_CODES: Dict[str, str] = {
 
 def get_whisper_model_size() -> str:
     """Pick a Whisper model size based on available hardware (or config.yaml override)."""
-    # config.yaml takes priority
+    # config.yaml override
     override = APP_CONFIG.get("whisper_model")
     if override:
         logging.info(f"[CONFIG] whisper_model override: {override!r}")
@@ -180,7 +163,7 @@ def get_whisper_model_size() -> str:
 def create_project_structure(video_path: str, target_language: str) -> str:
     logging.info("Creating project structure...")
     base_name = os.path.splitext(os.path.basename(video_path))[0]
-    # Use a simpler project directory name, target_language will be in filenames
+    # target language is included in output filename
     project_dir_name = f"{base_name}_translated_output"
     project_dir = os.path.join(os.getcwd(), project_dir_name)
     os.makedirs(project_dir, exist_ok=True)
@@ -454,7 +437,7 @@ def _translate_text_nllb(
     num_beams: int = 4,
     length_penalty: float = 1.0,
 ) -> str:
-    """Translate text using an NLLB-200 model ([PLAN_h.md L787–L807](PLAN_h.md))."""
+    """Translate text with NLLB-200."""
     if not text.strip():
         return ""
     if source_language == target_language:
@@ -493,7 +476,7 @@ def translate_with_length_target(
     tokenizer,
     target_length_ratio: float = 1.0,
 ) -> str:
-    """Translate encouraging shorter output when target_length_ratio < 0.85 ([PLAN_h.md L890–L915](PLAN_h.md))."""
+    """Translate text with optional length bias."""
     if not text.strip() or src_lang == tgt_lang:
         return text
     length_penalty = 0.6 if target_length_ratio < 0.85 else 1.0
@@ -511,10 +494,7 @@ def batch_translate_segments(
     tokenizer,
     batch_size: int = 8,
 ) -> List[dict]:
-    """Translate all transcript segments in batches before TTS begins ([PLAN_h.md L1238–L1282](PLAN_h.md)).
-
-    Returns copies of the segment dicts with a ``'translated_text'`` key added.
-    """
+    """Batch-translate segments and add `translated_text` to each result."""
     src_nllb = NLLB_LANG_CODES.get(src_lang, f"{src_lang}_Latn")
     tgt_nllb = NLLB_LANG_CODES.get(tgt_lang, f"{tgt_lang}_Latn")
     target_lang_id = tokenizer.convert_tokens_to_ids(tgt_nllb)
@@ -559,13 +539,7 @@ def analyze_segment_timing_budget(
     translations: List[str],
     target_lang: str,
 ) -> List[Dict]:
-    """Pre-screen every segment for timing difficulty before TTS synthesis ([PLAN_h.md L950–L975](PLAN_h.md)).
-
-    Returns list of dicts with keys:
-      segment, translation, available_ms, estimated_ms, ratio, action
-
-    Action values: ``"natural"`` | ``"speed_up_tts"`` | ``"slow_down_tts"`` | ``"compress_translation"``
-    """
+    """Estimate timing pressure for each translated segment."""
     cps = CPS_MAP.get(target_lang, 14.0)
     results = []
     for seg, trans in zip(segments, translations):
@@ -633,9 +607,7 @@ def merge_short_segments(segments: List[dict], min_ms: int = MIN_SEGMENT_MS) -> 
 
 def split_translation_at_clauses(text: str) -> List[str]:
     """Split translated text at sentence boundaries only (not commas)."""
-    # Only split at strong boundaries: period, exclamation, question mark
     clauses = re.split(r'(?<=[.!?])\s+', text.strip())
-    # Filter out very short clauses (< 4 words) — merge back with previous
     merged = []
     for clause in clauses:
         if clause.strip():
@@ -655,7 +627,7 @@ def synthesise_with_pauses(
     speaker_id: Optional[str],
     segment_index: int,
 ) -> AudioSegment:
-    """Synthesize clause-by-clause and interleave silence to reduce overflow pressure."""
+    """Synthesize clause-by-clause with optional pauses."""
     clauses = split_translation_at_clauses(text)
     if len(clauses) <= 1:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -716,10 +688,7 @@ def synthesise_with_pauses(
 
 
 def load_translation_model(tier: str) -> Tuple:
-    """Load the NLLB-200 translation model and tokenizer for the given hardware tier ([PLAN_h.md L762–L770](PLAN_h.md)).
-
-    Respects ``config.yaml`` ``translation_model`` key to override the tier default.
-    """
+    """Load translation model/tokenizer for the selected tier."""
     model_id, model_device, dtype_str = TRANSLATION_MODEL_TIERS.get(
         tier, TRANSLATION_MODEL_TIERS["gpu_medium"]
     )
@@ -746,24 +715,16 @@ def load_translation_model(tier: str) -> Tuple:
     return trans_model, tokenizer
 
 def enhance_voice(audio: AudioSegment) -> AudioSegment:
-    """Enhance voice with EQ, compression, and normalization."""
+    """Apply light EQ, compression, and normalization."""
     enhanced = audio.high_pass_filter(85) # Cut sub-bass rumble
-    # Optional: slight boost in presence/clarity range, e.g., 2-5kHz, but be careful.
-    # enhanced = enhanced.low_pass_filter(10000) # Cut very high hiss if present
 
-    # Compressor: threshold, ratio, attack, release. Tune these.
     enhanced = pydub_effects.compress_dynamic_range(enhanced, threshold=-18.0, ratio=3.0, attack=5.0, release=100.0)
-    
-    # Normalize to a target peak level (e.g., -1.0 dBFS for headroom)
+
     enhanced = pydub_effects.normalize(enhanced, headroom=1.0)
     return enhanced
 
 def advanced_time_stretch(audio: AudioSegment, target_duration_ms: int) -> AudioSegment:
-    """
-    High-quality time-stretch using Rubber Band Library v4 via pyrubberband.
-    Handles ratios from 0.25–4.0 with minimal artifacts on speech.
-    Requires: sudo apt-get install rubberband-cli
-    """
+    """Time-stretch audio with pyrubberband and clamp extreme rates."""
     if len(audio) == 0 or target_duration_ms <= 0:
         return audio if len(audio) > 0 else AudioSegment.silent(duration=10)
 
@@ -794,7 +755,6 @@ def advanced_time_stretch(audio: AudioSegment, target_duration_ms: int) -> Audio
     else:
         stretched = pyrb.time_stretch(samples, sr, rate)
 
-    # Precise sample-count correction to avoid off-by-one drift
     target_samples = int(target_duration_ms / 1000 * sr) * audio.channels
     if len(stretched) > target_samples:
         stretched = stretched[:target_samples]
@@ -820,11 +780,7 @@ def estimate_ideal_tts_speed(
     lang_code: str,
     tts_mode: str = "melo",
 ) -> float:
-    """
-    Pre-TTS speed estimation (MeloTTS only).
-    For Qwen3/gTTS, returns 1.0 immediately — speed is not a numeric parameter there.
-    Requires the language to be in CPS_MAP (MeloTTS-supported set).
-    """
+    """Estimate MeloTTS speed to better fit segment duration."""
     if tts_mode != "melo":
         return 1.0
     if lang_code not in CPS_MAP:
@@ -864,9 +820,6 @@ def fit_tts_to_slot(
     STRETCH_CEIL  = 1.50
 
     if ratio > 1.10:
-        # Try borrowing from next gap first before stretching or trimming.
-        # Cap the borrow so effective_ratio stays inside [STRETCH_FLOOR, STRETCH_CEIL]:
-        # borrowing too much pushes rate below 0.65, rubberband clamps silently, leaving a silent hole.
         max_effective_ms = int(tts_ms / STRETCH_FLOOR)   # floor constraint: rate can't go below 0.65
         raw_effective_ms = available_ms + next_gap_ms
         effective_ms = min(raw_effective_ms, max_effective_ms)
@@ -881,7 +834,6 @@ def fit_tts_to_slot(
             )
             return stretched
 
-        # Gap borrowing not enough — stretch to 1.5x hard cap, then trim
         safe_target_ms = int(tts_ms / 1.50)
         stretched = advanced_time_stretch(tts_audio, safe_target_ms)
         trimmed = stretched[:available_ms]
@@ -894,7 +846,6 @@ def fit_tts_to_slot(
     if ratio < 0.75:
         silence_ms = max(0, available_ms - tts_ms)
         if silence_ms > 400:
-            # Distribute: small lead-in silence + speech + remaining silence
             lead_ms = min(150, silence_ms // 4)
             tail_ms = silence_ms - lead_ms
             padded = (
@@ -912,11 +863,8 @@ def fit_tts_to_slot(
         )
         return padded
 
-    # 0.75–0.90: gentle stretch
     return advanced_time_stretch(tts_audio, available_ms)
 
-
-# --- Segment Processing and Synchronization ---
 def process_segment(
     segment_info: Tuple[int, dict],
     target_language_code: str,
@@ -925,12 +873,7 @@ def process_segment(
     speaker_id: Optional[str] = None,
     next_gap_ms: int = 0,
 ):
-    """Synthesise and time-stretch one pre-translated segment.
-
-    The segment dict is expected to have a ``'translated_text'`` key injected
-    by ``batch_translate_segments`` before this function is called.
-
-    """
+    """Synthesize and fit one translated segment."""
     i, segment = segment_info
     start_time_ms = int(segment['start'] * 1000)
     end_time_ms = int(segment['end'] * 1000)
@@ -940,7 +883,6 @@ def process_segment(
         logging.warning(f"Segment {i} has zero/negative duration ({original_duration_ms}ms). Skipping.")
         return None
 
-    # Translation was done in a pre-pass by batch_translate_segments
     translated_text = segment.get("translated_text", "").strip()
     if not translated_text:
         logging.warning(f"Segment {i}: No translated_text on segment. Skipping TTS.")
@@ -951,14 +893,12 @@ def process_segment(
     tts_output_path = os.path.join(segments_dir, f"segment_{i:04d}.wav")
 
 
-    # Use word-level start for more precise overlay position.
     words = segment.get("words", [])
     word_starts = [w["start"] for w in words if w.get("start") is not None]
     if word_starts:
         start_time_ms = max(0, int(word_starts[0] * 1000) - 30)  # 30ms pre-roll pad
 
     try:
-        # CPS estimation only valid for MeloTTS — skip for Qwen3/gTTS
         tts_mode_active = tts_engine.mode if tts_engine is not None else "gtts"
         ideal_speed = estimate_ideal_tts_speed(
             translated_text, original_duration_ms, target_language_code, tts_mode=tts_mode_active
@@ -969,10 +909,9 @@ def process_segment(
             estimated_ms = int((len(translated_text) / cps) * 1000)
             estimated_ratio = estimated_ms / original_duration_ms if original_duration_ms > 0 else 1.0
         else:
-            estimated_ratio = 1.0  # no CPS estimate available — synthesise normally
+            estimated_ratio = 1.0
 
         if estimated_ratio < 0.75 and original_duration_ms > 1200:
-            # Underflow with enough room: use clause-level pauses to fill naturally
             generated_audio = synthesise_with_pauses(
                 translated_text,
                 original_duration_ms,
@@ -984,7 +923,6 @@ def process_segment(
             )
             generated_audio.export(tts_output_path, format="wav")
         else:
-            # Overflow or natural: single synthesis call
             text_to_speech(translated_text, target_language_code, tts_output_path,
                            tts_engine=tts_engine, speed=ideal_speed, speaker_id=speaker_id)
             generated_audio = AudioSegment.from_file(tts_output_path)
@@ -1010,17 +948,10 @@ def adaptive_segment_processing(
     tts_engine: Optional["TTSEngine"],
     speaker_id: Optional[str] = None,
 ):
-    """Synthesise all pre-translated segments sequentially.
-
-    ``segments_data`` must be a list of dicts that each have a ``'translated_text'``
-    key (injected by ``batch_translate_segments`` in ``process_video``).
-    Computes ``next_gap_ms`` for each segment so ``fit_tts_to_slot`` can borrow
-    time from inter-segment silence when needed.
-    """
+    """Synthesize all translated segments sequentially."""
     segments_dir = os.path.join(project_dir, 'translated_segments')
     processed_segments_info = []
 
-    # Pre-compute gap after each segment (time before next segment starts)
     next_gaps_ms = []
     for i, seg in enumerate(segments_data):
         if i + 1 < len(segments_data):
@@ -1043,25 +974,12 @@ def adaptive_segment_processing(
 
     return processed_segments_info
 
-
-# ---------------------------------------------------------------------------
-# Word-level speech intervals
-# ---------------------------------------------------------------------------
-
 def build_speech_intervals(
     transcript: dict,
     pad_start_ms: int = 30,
     pad_end_ms: int = 50,
 ) -> List[Tuple[int, int]]:
-    """
-    Build precise speech intervals from WhisperX word-level timestamps.
-
-    pad_start_ms: bring silence in EARLIER than actual word start (pre-roll removal)
-    pad_end_ms:   keep original muted slightly LONGER after word ends (post-roll)
-
-    Words within 300ms of each other are merged into a single contiguous speech block.
-    Falls back to segment-level timestamps when no word-level data exists.
-    """
+    """Build speech intervals from word timestamps, with segment fallback."""
     words: List[Tuple[int, int]] = []
     for seg in transcript.get("segments", []):
         for w in seg.get("words", []):
@@ -1071,7 +989,6 @@ def build_speech_intervals(
                 words.append((int(s * 1000), int(e * 1000)))
 
     if not words:
-        # Fallback: segment-level timestamps with padding
         return sorted([
             (max(0, int(s["start"] * 1000) - pad_start_ms),
              int(s["end"] * 1000) + pad_end_ms)
@@ -1079,7 +996,6 @@ def build_speech_intervals(
             if s["end"] > s["start"]
         ])
 
-    # Merge words into contiguous blocks (gap < 300ms = same block)
     intervals: List[Tuple[int, int]] = []
     block_start = words[0][0] - pad_start_ms
     block_end   = words[0][1] + pad_end_ms
@@ -1093,24 +1009,13 @@ def build_speech_intervals(
     intervals.append((max(0, block_start), block_end))
     return sorted(intervals)
 
-
-# ---------------------------------------------------------------------------
-# Demucs source separation
-# ---------------------------------------------------------------------------
-
 def separate_vocals_from_audio(
     audio_path: str,
     output_dir: str,
     device_obj,  # torch.device
     model_name: str = "htdemucs_ft",
 ) -> Tuple[str, str]:
-    """
-    Separate audio into vocals and background (all non-vocal stems summed).
-    Returns (vocals_wav_path, background_wav_path).
-
-    Uses htdemucs_ft (fine-tuned hybrid Transformer Demucs) — best quality.
-    Requires ~3GB VRAM on GPU; automatically falls back to overlap-add on CPU.
-    """
+    """Separate input audio into vocals and background stems."""
     if device_obj.type == "cuda":
         logging.info(f"[DEMUCS] Using GPU: {torch.cuda.get_device_name(device_obj)}")
     else:
@@ -1131,8 +1036,6 @@ def separate_vocals_from_audio(
 
     with torch.no_grad():
         sources = demucs_apply_model(demucs_model, wav, split=True, overlap=0.25)[0]
-    # sources shape: (n_stems, 2, samples)  —  ['drums', 'bass', 'other', 'vocals']
-
     source_names = demucs_model.sources
     vocal_idx = source_names.index("vocals")
 
@@ -1162,31 +1065,20 @@ def preserve_sound_effects(
     project_dir: str,
     device_obj,  # torch.device
 ) -> AudioSegment:
-    """
-    Demucs-based audio mixer.
-
-    Strategy:
-    1. Separate original audio into vocals + background (Demucs htdemucs_ft)
-    2. Silence ONLY the vocals stem during speech blocks → SFX/music fully preserved
-    3. Apply gentle -8dB duck (not -18dB) with 80ms fade edges during speech windows
-    4. Overlay translated TTS on the clean background track
-    """
+    """Mix translated speech with Demucs-separated background."""
     debug_dir = os.path.join(project_dir, "audio_debug")
     extracted_audio_path = os.path.join(project_dir, "audio", "extracted_audio.wav")
 
-    # A1: reuse pre-computed stems from step 2 of process_video so Demucs is never
-    # loaded alongside Whisper, NLLB, or TTSEngine.  Fall back to on-demand separation
-    # only if stems are missing (e.g. when this function is called standalone in tests).
+    # Reuse precomputed stems when available.
     _pre_vocals = os.path.join(project_dir, "audio", "demucs_vocals.wav")
     _pre_bg     = os.path.join(project_dir, "audio", "demucs_background.wav")
     if os.path.exists(_pre_vocals) and os.path.exists(_pre_bg):
         vocals_path = _pre_vocals
         bg_path     = _pre_bg
-        logging.info("[MIX] Reusing pre-computed Demucs stems (A1 lifecycle).")
+        logging.info("[MIX] Reusing precomputed Demucs stems.")
     else:
         logging.warning(
-            "[MIX] Demucs stems not found at expected paths — running separation now. "
-            "This means Demucs is loading while other models may still occupy VRAM (A1 violated)."
+            "[MIX] Demucs stems not found; running separation now."
         )
         vocals_path, bg_path = separate_vocals_from_audio(
             extracted_audio_path, project_dir, device_obj
@@ -1200,7 +1092,6 @@ def preserve_sound_effects(
 
     speech_intervals = build_speech_intervals(transcript)
 
-    # Gentle duck (-8dB) with fade edges during speech windows
     DUCK_DB   = -8.0
     FADE_MS   = 80
     final_mix = background_seg
@@ -1228,10 +1119,7 @@ def create_synced_audio_track(
     tts_engine: Optional["TTSEngine"],
     speaker_id: Optional[str] = None,
 ) -> AudioSegment:
-    """Creates a single audio track of the translated speech, synced to original timings.
-
-    ``translated_segments`` must be pre-translated (each dict has ``'translated_text'``).
-    """
+    """Build a synced translated speech track from translated segments."""
     logging.info("Creating full synced translated speech track with segment fades...")
     target_channels = original_audio_ref.channels
 
@@ -1248,9 +1136,8 @@ def create_synced_audio_track(
 
     for start_time_ms, audio_filepath in processed_segments_info:
         try:
-            segment_audio = AudioSegment.from_file(audio_filepath).set_channels(target_channels) # Ensure channel match
-            
-            # Apply crossfades if segment is long enough
+            segment_audio = AudioSegment.from_file(audio_filepath).set_channels(target_channels)
+
             if CROSSFADE_MS > 0:
                 fade_len = min(CROSSFADE_MS, len(segment_audio) // 2 if len(segment_audio) > 0 else 0)
                 if fade_len > 0:
@@ -1267,15 +1154,7 @@ def create_synced_audio_track(
 
 
 def create_final_video(video_path: str, audio_path: str, output_path: str) -> None:
-    """Replace audio track using FFmpeg stream-copy — 10–50× faster than moviepy.
-
-    Video stream is copied without re-encoding (-c:v copy).  Audio is encoded
-    to AAC at 192k to satisfy the MP4 container.
-
-    Raises:
-        RuntimeError: if ffmpeg is not in $PATH or if the FFmpeg process fails.
-    ([PLAN_h.md L1013–L1031](PLAN_h.md))
-    """
+    """Replace the video audio track using FFmpeg stream copy."""
     if not shutil.which("ffmpeg"):
         raise RuntimeError(
             "ffmpeg not found in $PATH.  "
@@ -1302,8 +1181,6 @@ def create_final_video(video_path: str, audio_path: str, output_path: str) -> No
         )
     logging.info(f"[FFMPEG] Final video created: {output_path}")
 
-
-# --- Main Processing Function ---
 def process_video(
     video_path: str,
     target_language_code: str,
@@ -1312,26 +1189,12 @@ def process_video(
     melo_speaker_id: Optional[str] = None,
     enable_voice_cloning: bool = True,
 ) -> Optional[str]:
-    """Main translation pipeline.
-
-    Args:
-        video_path: Path to the source video file.
-        target_language_code: Short language code like ``"en"``, ``"fr"``.
-        tts_mode: TTS backend — ``"melo"`` | ``"qwen3"`` | ``"gtts"``.
-        qwen3_model_size: Qwen3-TTS model size ``"0.6B"`` or ``"1.7B"`` (only
-                          used when *tts_mode* is ``"qwen3"``).
-        melo_speaker_id: Explicit MeloTTS speaker ID (e.g. ``"EN-BR"``);
-                         ``None`` auto-selects the default for the target language.
-        enable_voice_cloning: When ``True`` and ``tts_mode="qwen3"``, extract a
-                              voice-reference clip and pre-compute a voice-clone
-                              embedding before synthesis begins.
-    """
+    """Main video translation pipeline."""
 
     performance_monitor.log_gpu_status_direct()
     output_video_path = None  # Initialize
 
-    # Apply config.yaml parameter overrides (caller args take precedence
-    # only when they differ from defaults; config provides non-default fallbacks).
+    # Apply config.yaml overrides.
     tts_mode = APP_CONFIG.get("tts_mode", tts_mode) or tts_mode
     qwen3_model_size = APP_CONFIG.get("qwen3_model_size", qwen3_model_size) or qwen3_model_size
     if APP_CONFIG.get("enable_voice_cloning") is not None:
@@ -1343,17 +1206,14 @@ def process_video(
     with performance_monitor.timer("total_video_processing_pipeline"):
         project_dir = create_project_structure(video_path, target_language_code)
 
-        # Models managed explicitly so they can be sequentially unloaded before the next loads.
+        # Keep heavy models loaded one-at-a-time.
         translation_model, translation_tokenizer = None, None
 
         try:
-            # 1. Audio Extraction
             with performance_monitor.timer("audio_extraction"):
                 extracted_audio_path = os.path.join(project_dir, 'audio', 'extracted_audio.wav')
                 extract_audio(video_path, extracted_audio_path)
 
-            # 2. Demucs source separation — must run BEFORE transcription/translation/TTS so
-            #    only one large model occupies VRAM at a time. (A1: sequential model lifecycle)
             with performance_monitor.timer("demucs_source_separation"):
                 cfg_tier_early = APP_CONFIG.get("hardware_tier", "auto")
                 hw_tier_early = (
@@ -1368,11 +1228,9 @@ def process_video(
                 separate_vocals_from_audio(
                     extracted_audio_path, project_dir, device, model_name=_demucs_model_name
                 )
-                # separate_vocals_from_audio deletes the Demucs model internally and calls
-                # gpu_optimizer.clear_cache() — VRAM is freed here before Whisper loads.
-                logging.info("[LIFECYCLE] Demucs unloaded. VRAM freed before transcription.")
+                # separate_vocals_from_audio clears Demucs and cache.
+                logging.info("[LIFECYCLE] Demucs unloaded before transcription.")
 
-            # 3. Transcription
             with performance_monitor.timer("transcription"):
                 transcript_data = transcribe_with_whisper(extracted_audio_path)
                 source_language_detected = transcript_data.get('language', 'en')
@@ -1389,10 +1247,8 @@ def process_video(
                 )
                 f.write(transcript_data.get('text') or fallback_text)
 
-            # 4. Translation — NLLB-200 (load → batch translate all segments → unload before TTS)
             with performance_monitor.timer("translation_model_loading"):
-                # Respect config.yaml hardware_tier override.
-                # hw_tier_early was already resolved in step 2; reuse it.
+                # Reuse tier resolved in step 2.
                 hw_tier = hw_tier_early
                 logging.info(f"Hardware tier: {hw_tier}")
                 translation_model, translation_tokenizer = load_translation_model(hw_tier)
@@ -1407,7 +1263,7 @@ def process_video(
                     f"segments after short-segment merge"
                 )
 
-                # First pass: translate all segments at length_penalty=1.0
+                # First pass translation
                 translated_segments = batch_translate_segments(
                     merged_input_segments,
                     source_language_detected,
@@ -1416,21 +1272,19 @@ def process_video(
                     translation_tokenizer,
                 )
 
-                # Save full translated text to file (join segment translations)
+                # Save combined translated text
                 full_translated_text = " ".join(s['translated_text'] for s in translated_segments)
                 translated_text_path = os.path.join(project_dir, 'translations', 'translation.txt')
                 with open(translated_text_path, 'w', encoding='utf-8') as f:
                     f.write(full_translated_text)
 
-                # Timing budget pre-screen.
+                # Timing budget pre-screen
                 translation_texts = [s['translated_text'] for s in translated_segments]
                 timing_budget = analyze_segment_timing_budget(
                     merged_input_segments, translation_texts, target_language_code
                 )
 
-                # Second pass: re-translate overflow segments with compression bias.
-                # Iterative schedule — tightens penalty each pass until the CPS estimate
-                # fits or all passes are exhausted. Normal segments exit after pass 1.
+                # Second pass for overflow segments.
                 COMPRESSION_SCHEDULE = [
                     (1.8, 0.85),   # pass 1 — gentle   (ratio threshold, target_ratio)
                     (1.5, 0.70),   # pass 2 — moderate
@@ -1447,7 +1301,7 @@ def process_video(
                         current_translation = translated_segments[idx]['translated_text']
 
                         for pass_num, (ratio_threshold, target_ratio) in enumerate(COMPRESSION_SCHEDULE, 1):
-                            # Check if the current translation already fits
+                            # Skip if current text already fits.
                             estimated_ms = int((len(current_translation) / _cps) * 1000) if _cps > 0 else available_ms
                             current_ratio = estimated_ms / available_ms if available_ms > 0 else 1.0
 
@@ -1484,17 +1338,13 @@ def process_video(
 
                         translated_segments[idx]['translated_text'] = current_translation
 
-            # Release translation model BEFORE TTS loads — sequential VRAM lifecycle (A1).
-            # At this point: Demucs already unloaded (step 2), Whisper unloaded (step 3),
-            # translation model about to be unloaded → VRAM clear for TTSEngine next.
+            # Release translation model before TTS.
             logging.info("Unloading translation model to free VRAM before TTS.")
             del translation_model, translation_tokenizer
             translation_model, translation_tokenizer = None, None
             gpu_optimizer.clear_cache()
             gc.collect()
 
-            # 5. Audio Synthesis and Synchronization
-            # TTSEngine context manager ensures model is unloaded before mixing step.
             original_audio_segment = AudioSegment.from_wav(extracted_audio_path)
             logging.info(f"Original audio duration: {len(original_audio_segment)/1000:.2f}s")
 
@@ -1549,9 +1399,8 @@ def process_video(
                         tts_engine,
                         melo_speaker_id,
                     )
-                # tts_engine.__exit__ fires here: models unloaded, VRAM freed
+                # TTSEngine context exits here.
 
-            # 6. Preserve sound effects and mix audio (Demucs stem reuse)
             with performance_monitor.timer("audio_mixing_with_effects"):
                 final_mixed_audio_segment = preserve_sound_effects(
                     original_audio_segment,
@@ -1565,7 +1414,6 @@ def process_video(
             logging.info(f"Exporting final mixed audio to: {final_audio_output_path}")
             final_mixed_audio_segment.export(final_audio_output_path, format="wav")
 
-            # 7. Create final video (FFmpeg stream-copy)
             with performance_monitor.timer("final_video_creation"):
                 base_video_name = os.path.splitext(os.path.basename(video_path))[0]
                 output_video_path = os.path.join(project_dir, f"{base_video_name}_translated_{target_language_code}.mp4")
@@ -1575,16 +1423,14 @@ def process_video(
 
         except Exception as e:
             logging.error(f"Critical error in process_video: {e}", exc_info=True)
-            # output_video_path remains None or its last value if error occurred mid-way
             raise # Re-raise the exception to be caught by the caller
         finally:
-            # Cleanup models (translation model may already be None if successfully unloaded above)
+            # Cleanup models
             logging.info("Cleaning up models from process_video scope...")
             if translation_model: del translation_model
             if translation_tokenizer: del translation_tokenizer
-            # TTSEngine lifecycle is managed by its context manager; no manual cleanup needed here.
             
-            # Clean up intermediate audio segments from disk
+            # Clean up intermediate segment files
             segments_dir_cleanup = os.path.join(project_dir, 'translated_segments')
             if os.path.exists(segments_dir_cleanup):
                 try:
@@ -1596,13 +1442,13 @@ def process_video(
             gpu_optimizer.clear_cache()
             gc.collect()
             logging.info("process_video cleanup complete.")
-            logging.info(performance_monitor.get_summary()) # Log summary at the end
+            logging.info(performance_monitor.get_summary())
 
     return output_video_path
 
 
 if __name__ == "__main__":
-    if len(sys.argv) not in [3, 4]: # Optional project_dir
+    if len(sys.argv) not in [3, 4]:
         print("Usage: python translator.py <video_path> <target_language_code> [custom_output_base_dir]")
         print("Example: python translator.py myvideo.mp4 fr")
         print("Example: python translator.py myvideo.mp4 fr /path/to/custom_outputs")
@@ -1620,13 +1466,10 @@ if __name__ == "__main__":
         logging.error(f"Available languages: {list(LANGUAGE_MODEL_MAP.keys())}")
         sys.exit(1)
 
-    # Optional: Allow overriding the base output directory
+    # Optional output base argument (reserved)
     if len(sys.argv) == 4:
         custom_output_base = sys.argv[3]
-        # Modify create_project_structure or pass base_dir to it if this is desired.
-        # For now, project structure is created relative to CWD.
-        # This example doesn't use custom_output_base directly, but shows how it could be passed.
-        logging.info(f"Custom output base directory specified (not yet fully implemented in this example): {custom_output_base}")
+        logging.info(f"Custom output base directory specified (currently informational): {custom_output_base}")
 
 
     logging.info(f"Starting translation for: {video_file_path} to {target_lang}")
@@ -1641,9 +1484,7 @@ if __name__ == "__main__":
 
     except Exception as e:
         print(f"\n❌ An error occurred during the translation process:")
-        # Log the full traceback for debugging
         logging.error("Main script execution error", exc_info=True) 
-        # Print a simpler error to console
         print(f"Error details: {e}")
     finally:
         logging.info("Video translation script finished.")
