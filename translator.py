@@ -3,13 +3,10 @@ import sys
 import logging
 import subprocess
 import tempfile
-import math
 import shutil
-import mmap
 import re
 from typing import List, Tuple, Dict, Optional
 import numpy as np
-import concurrent.futures
 import gc # For garbage collection
 
 import whisperx
@@ -17,21 +14,16 @@ import pyrubberband as pyrb
 import torchaudio
 from demucs.pretrained import get_model as demucs_get_model
 from demucs.apply import apply_model as demucs_apply_model
-from moviepy import VideoFileClip, AudioFileClip
+from moviepy import VideoFileClip
 # CompositeAudioClip might not be directly used if pydub handles all composition
 from gtts import gTTS
 from pydub import AudioSegment, effects as pydub_effects # Renamed to avoid conflict
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from tqdm import tqdm
 # from pydub.playback import play # Not used in the new script's core logic
-from pydub.silence import detect_nonsilent
 
 import torch
-import torch.nn as nn # Not directly used in the final script but good for context
 
-import librosa
-import soundfile as sf
-import noisereduce as nr
 import yaml
 
 # Import from new local modules
@@ -39,7 +31,7 @@ from gpu_config import gpu_optimizer, detect_hardware_tier
 from performance_monitor import performance_monitor
 
 # TTS engine — TTSEngine, MELO_ALL_SPEAKERS, get_all_speaker_ids are defined in tts_engine.py
-from tts_engine import TTSEngine, MELO_ALL_SPEAKERS, get_all_speaker_ids
+from tts_engine import TTSEngine
 
 
 # Set up logging
@@ -61,7 +53,7 @@ logging.basicConfig(
 )
 logging.info("Logging system initialized for translator.py.")
 
-# --- Phase 4 / Issue 8: config.yaml override ---
+# --- Optional config.yaml override ---
 def _load_app_config(path: str = "config.yaml") -> dict:
     """Load optional config.yaml.  Returns {} if the file is absent or invalid."""
     try:
@@ -88,11 +80,11 @@ device = gpu_optimizer.device
 if device.type == "cuda":
     gpu_name = torch.cuda.get_device_name(device)
     vram_gb  = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
-    logging.info(f"[Device] Running on GPU: {gpu_name} ({vram_gb:.1f} GB VRAM)")
+    logging.info(f"[DEVICE] Running on GPU: {gpu_name} ({vram_gb:.1f} GB VRAM)")
 else:
     import psutil
     ram_gb = psutil.virtual_memory().total / (1024 ** 3)
-    logging.info(f"[Device] Running on CPU (no CUDA device found). System RAM: {ram_gb:.1f} GB")
+    logging.info(f"[DEVICE] Running on CPU (no CUDA device found). System RAM: {ram_gb:.1f} GB")
 
 # Language mapping for MeloTTS and fallback gTTS language codes
 LANGUAGE_MODEL_MAP: Dict[str, Dict[str, str]] = {
@@ -110,10 +102,9 @@ LANGUAGE_MODEL_MAP: Dict[str, Dict[str, str]] = {
 
 DUCKING_GAIN_DB = -18  # How much to reduce original audio volume during translated speech
 CROSSFADE_MS = 50     # Crossfade duration for audio segments
-BOUNDARY_FADE_MS = 12  # Phase 4 / Issue 12: fade ms at silence cut-points to kill pops
 MIN_SEGMENT_MS = 800
 
-# --- Phase 1a: Hardware-tiered Whisper model sizes ---
+# --- Hardware-tiered Whisper model sizes ---
 WHISPER_MODEL_TIERS: Dict[str, str] = {
     "cpu_low":    "base",               # 74M params, CPU-friendly
     "cpu_high":   "small",              # 244M params
@@ -122,7 +113,7 @@ WHISPER_MODEL_TIERS: Dict[str, str] = {
     "gpu_high":   "large-v3",           # 1.54B params, max accuracy
 }
 
-# --- Phase 3b: Empirical chars/sec per language at MeloTTS speed=1.0 ---
+# --- Empirical chars/sec per language at MeloTTS speed=1.0 ---
 # NOTE: These values should be re-calibrated after any MeloTTS update.
 # Run:  python calibrate_cps.py  and paste the output here.
 # Only MeloTTS-supported languages are listed. DE/PT use gTTS which has no speed control.
@@ -135,7 +126,7 @@ CPS_MAP: Dict[str, float] = {
     "ko": 5.7,
 }
 
-# --- Phase 3: NLLB-200 translation model tiers ---
+# --- NLLB-200 translation model tiers ---
 TRANSLATION_MODEL_TIERS: Dict[str, Tuple[str, str, str]] = {
     "cpu_low":    ("facebook/nllb-200-distilled-600M", "cpu",  "float32"),
     "cpu_high":   ("facebook/nllb-200-1.3B",           "cpu",  "float32"),
@@ -164,7 +155,7 @@ def get_whisper_model_size() -> str:
     # config.yaml takes priority
     override = APP_CONFIG.get("whisper_model")
     if override:
-        logging.info(f"[config] whisper_model override: {override!r}")
+        logging.info(f"[CONFIG] whisper_model override: {override!r}")
         return override
 
     hw_tier = APP_CONFIG.get("hardware_tier", "auto")
@@ -200,18 +191,6 @@ def create_project_structure(video_path: str, target_language: str) -> str:
     logging.info(f"Project directory: {project_dir}")
     return project_dir
 
-def memory_mapped_audio_loader(audio_path: str) -> np.ndarray:
-    logging.info(f"Loading audio with memory mapping attempt: {audio_path}")
-    try:
-        # Librosa handles resampling and mono conversion directly and is robust.
-        # Whisper expects 16kHz mono float32 numpy array.
-        audio_data, sr = librosa.load(audio_path, sr=16000, mono=True)
-        logging.info(f"Audio loaded via librosa: shape={audio_data.shape}, dtype={audio_data.dtype}, sr={sr}")
-        return audio_data
-    except Exception as e:
-        logging.error(f"Librosa loading failed for {audio_path}: {e}", exc_info=True)
-        raise
-
 def extract_audio(video_path: str, output_path: str) -> str:
     logging.info(f"Extracting audio from video: {video_path} to {output_path}")
     try:
@@ -235,9 +214,9 @@ def transcribe_with_whisperx(audio_path: str) -> dict:
     device_str = str(device).split(":")[0]  # "cuda" or "cpu"
 
     if device.type == "cuda":
-        logging.info(f"[WhisperX] Using GPU: {torch.cuda.get_device_name(device)}")
+        logging.info(f"[WHISPERX] Using GPU: {torch.cuda.get_device_name(device)}")
     else:
-        logging.info("[WhisperX] Using CPU (no GPU available)")
+        logging.info("[WHISPERX] Using CPU (no GPU available)")
     logging.info(f"Loading WhisperX model: {model_size!r}, compute={compute_type!r}, device={device_str!r}")
     try:
         wx_model = whisperx.load_model(
@@ -640,7 +619,7 @@ def merge_short_segments(segments: List[dict], min_ms: int = MIN_SEGMENT_MS) -> 
             }
             merged.append(combined)
             logging.info(
-                f"[merge_short_segments] merged seg {i} ({duration_ms}ms) + seg {i+1} "
+                f"[MERGE] merged seg {i} ({duration_ms}ms) + seg {i+1} "
                 f"({int(max(0.0, next_end - next_start) * 1000)}ms) -> "
                 f"{int(max(0.0, combined['end'] - combined['start']) * 1000)}ms"
             )
@@ -726,7 +705,7 @@ def synthesise_with_pauses(
             result += audio
 
         logging.info(
-            f"[prosodic_pause] seg {segment_index}: {len(clauses)} clauses, "
+            f"[PROSODIC_PAUSE] seg {segment_index}: {len(clauses)} clauses, "
             f"speech={total_speech_ms}ms, gaps={gap_ms}ms x {gap_count}, total={len(result)}ms"
         )
         return result
@@ -744,16 +723,16 @@ def load_translation_model(tier: str) -> Tuple:
     model_id, model_device, dtype_str = TRANSLATION_MODEL_TIERS.get(
         tier, TRANSLATION_MODEL_TIERS["gpu_medium"]
     )
-    # Phase 4 / Issue 8: config.yaml override
+    # Allow config.yaml to override the default model choice.
     cfg_model = APP_CONFIG.get("translation_model")
     if cfg_model:
-        logging.info(f"[config] translation_model override: {cfg_model!r}")
+        logging.info(f"[CONFIG] translation_model override: {cfg_model!r}")
         model_id = cfg_model
     if model_device == "cuda" and torch.cuda.is_available():
-        logging.info(f"[Translation] Using GPU: {torch.cuda.get_device_name(device)}")
+        logging.info(f"[TRANSLATION] Using GPU: {torch.cuda.get_device_name(device)}")
     else:
         model_device = "cpu"  # fall back gracefully if CUDA was requested but unavailable
-        logging.info("[Translation] Using CPU")
+        logging.info("[TRANSLATION] Using CPU")
     logging.info(f"Loading translation model: {model_id} on {model_device} ({dtype_str})")
 
     dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
@@ -765,60 +744,6 @@ def load_translation_model(tier: str) -> Tuple:
     trans_model.eval()
     logging.info(f"Translation model loaded: {model_id}")
     return trans_model, tokenizer
-
-# --- Audio Processing Functions ---
-def noise_reduction(audio: AudioSegment, reduction_amount: float = 0.6) -> AudioSegment:
-    """Applies noise reduction. reduction_amount (0.0 to 1.0, lower is less reduction)."""
-    if not (0.0 <= reduction_amount <= 1.0):
-        reduction_amount = np.clip(reduction_amount, 0.0, 1.0)
-        logging.warning(f"Noise reduction_amount clamped to {reduction_amount}")
-
-    samples = np.array(audio.get_array_of_samples()).astype(np.float32)
-    
-    # Normalize samples to [-1, 1] based on sample_width
-    if audio.sample_width == 2: # 16-bit
-        samples /= (2**15)
-    elif audio.sample_width == 1: # 8-bit unsigned
-        samples = (samples - 128) / 128.0
-    # Add other sample widths if necessary, or raise error for unsupported.
-
-    if audio.channels == 2:
-        samples_mono_for_profile = samples.reshape((-1, 2)).mean(axis=1)
-        # Create a noise profile from the mono version. `y_noise=None` lets `nr` estimate it.
-        # `stationary=False` might be better for general background noise.
-        # Using a portion of the audio if it's long, or assuming some silence, can improve profile.
-        # For simplicity, using the whole mono track to estimate noise characteristics.
-        # `prop_decrease=0` for `y_noise` means it's just estimating the noise profile.
-        noise_profile_segment = nr.reduce_noise(y=samples_mono_for_profile, sr=audio.frame_rate, prop_decrease=0.0, stationary=False)
-        
-        reduced_channels = []
-        for i in range(audio.channels):
-            channel_samples = samples.reshape((-1, audio.channels))[:, i]
-            # Apply reduction using the estimated noise profile (or characteristics from it)
-            # `y_noise` here should ideally be the actual noise clip if known, or `nr` uses its internal estimate.
-            # If `noise_profile_segment` is the noise itself, use it. If it's audio *with noise removed*, that's different.
-            # The API of `noisereduce` can be a bit nuanced here.
-            # Assuming `noise_profile_segment` is a representation of the noise to be reduced.
-            # A common pattern is to find a silent part and use that as `y_noise`.
-            # If `y_noise` is not provided, `nr` tries to estimate it from `y`.
-            reduced_channel = nr.reduce_noise(y=channel_samples, sr=audio.frame_rate, prop_decrease=reduction_amount, stationary=False) # y_noise=noise_profile_segment if it's actual noise
-            reduced_channels.append(reduced_channel)
-        reduced_noise_samples = np.stack(reduced_channels, axis=-1).flatten()
-    else: # Mono
-        reduced_noise_samples = nr.reduce_noise(y=samples, sr=audio.frame_rate, prop_decrease=reduction_amount, stationary=False)
-
-    # Convert back to original integer type
-    if audio.sample_width == 2:
-        reduced_noise_samples = (reduced_noise_samples * (2**15)).astype(np.int16)
-    elif audio.sample_width == 1:
-        reduced_noise_samples = ((reduced_noise_samples * 128) + 128).astype(np.uint8)
-
-    return AudioSegment(
-        reduced_noise_samples.tobytes(),
-        frame_rate=audio.frame_rate,
-        sample_width=audio.sample_width,
-        channels=audio.channels
-    )
 
 def enhance_voice(audio: AudioSegment) -> AudioSegment:
     """Enhance voice with EQ, compression, and normalization."""
@@ -834,66 +759,8 @@ def enhance_voice(audio: AudioSegment) -> AudioSegment:
     return enhanced
 
 def advanced_time_stretch(audio: AudioSegment, target_duration_ms: int) -> AudioSegment:
-    if len(audio) == 0 or target_duration_ms <= 0:
-        logging.warning(f"Cannot time stretch: audio len {len(audio)}ms, target {target_duration_ms}ms.")
-        return audio if len(audio) > 0 else AudioSegment.silent(duration=10)
-
-    logging.info(f"Time stretching. Input: {len(audio)/1000:.2f}s, Target: {target_duration_ms/1000:.2f}s")
-
-    samples = np.array(audio.get_array_of_samples()).astype(np.float32)
-    if audio.sample_width == 2: samples /= (2**15)
-    elif audio.sample_width == 1: samples = (samples - 128) / 128.0
-
-    if audio.channels == 2:
-        samples_mono = samples.reshape((-1, 2)).mean(axis=1)
-    else:
-        samples_mono = samples
-
-    # librosa.effects.time_stretch rate: > 1.0 speeds up, < 1.0 slows down
-    # rate = current_duration / target_duration
-    # If current is 10s, target 5s, rate = 2 (speed up)
-    # If current is 5s, target 10s, rate = 0.5 (slow down)
-    stretch_rate = len(audio) / target_duration_ms 
-    stretch_rate = np.clip(stretch_rate, 0.5, 2.0) # Clamp to avoid extreme distortion
-
-    logging.info(f"Librosa time_stretch rate: {stretch_rate:.2f}")
-    
-    stretched_mono = librosa.effects.time_stretch(samples_mono, rate=stretch_rate)
-
-    if audio.channels == 2:
-        # Duplicate mono to stereo
-        stretched_samples = np.vstack((stretched_mono, stretched_mono)).T.flatten()
-    else:
-        stretched_samples = stretched_mono
-    
-    # Ensure exact duration by padding/truncating (librosa stretch is approximate)
-    target_num_frames = int(target_duration_ms / 1000 * audio.frame_rate)
-    target_num_samples_total = target_num_frames * audio.channels
-    
-    current_num_samples = len(stretched_samples)
-
-    if current_num_samples > target_num_samples_total:
-        stretched_samples = stretched_samples[:target_num_samples_total]
-    elif current_num_samples < target_num_samples_total:
-        padding = np.zeros(target_num_samples_total - current_num_samples, dtype=np.float32)
-        stretched_samples = np.concatenate([stretched_samples, padding])
-
-    if audio.sample_width == 2:
-        stretched_samples = (stretched_samples * (2**15)).astype(np.int16)
-    elif audio.sample_width == 1:
-        stretched_samples = ((stretched_samples * 128) + 128).astype(np.uint8)
-    
-    return AudioSegment(
-        stretched_samples.tobytes(),
-        frame_rate=audio.frame_rate,
-        sample_width=audio.sample_width,
-        channels=audio.channels
-    )
-
-
-def advanced_time_stretch_v2(audio: AudioSegment, target_duration_ms: int) -> AudioSegment:
     """
-    Phase 3a: High-quality time-stretch using Rubber Band Library v4 via pyrubberband.
+    High-quality time-stretch using Rubber Band Library v4 via pyrubberband.
     Handles ratios from 0.25–4.0 with minimal artifacts on speech.
     Requires: sudo apt-get install rubberband-cli
     """
@@ -910,7 +777,7 @@ def advanced_time_stretch_v2(audio: AudioSegment, target_duration_ms: int) -> Au
             f"Clamping and padding/trimming to compensate."
         )
     rate = float(np.clip(rate, RATE_MIN, RATE_MAX))
-    logging.info(f"[pyrubberband] stretch rate={rate:.3f} ({current_duration_ms}ms → {target_duration_ms}ms)")
+    logging.info(f"[RUBBERBAND] stretch rate={rate:.3f} ({current_duration_ms}ms → {target_duration_ms}ms)")
 
     samples = np.array(audio.get_array_of_samples()).astype(np.float32)
     if audio.sample_width == 2:
@@ -954,7 +821,7 @@ def estimate_ideal_tts_speed(
     tts_mode: str = "melo",
 ) -> float:
     """
-    Phase 3b: Pre-TTS speed estimation (MeloTTS only).
+    Pre-TTS speed estimation (MeloTTS only).
     For Qwen3/gTTS, returns 1.0 immediately — speed is not a numeric parameter there.
     Requires the language to be in CPS_MAP (MeloTTS-supported set).
     """
@@ -990,7 +857,7 @@ def fit_tts_to_slot(
     ratio = tts_ms / available_ms
 
     if 0.90 <= ratio <= 1.10:
-        logging.info(f"[fit_tts_to_slot] seg {segment_index}: natural fit ({ratio:.2f}), no adjustment")
+        logging.info(f"[TTS_FIT] seg {segment_index}: natural fit ({ratio:.2f}), no adjustment")
         return tts_audio
 
     STRETCH_FLOOR = 0.65
@@ -1006,20 +873,20 @@ def fit_tts_to_slot(
         effective_ratio = tts_ms / effective_ms if effective_ms > 0 else ratio
 
         if effective_ratio <= STRETCH_CEIL:
-            stretched = advanced_time_stretch_v2(tts_audio, effective_ms)
+            stretched = advanced_time_stretch(tts_audio, effective_ms)
             actual_borrow = effective_ms - available_ms
             logging.info(
-                f"[fit_tts_to_slot] seg {segment_index}: borrowed {actual_borrow}ms "
+                f"[TTS_FIT] seg {segment_index}: borrowed {actual_borrow}ms "
                 f"from next gap (rate {ratio:.2f} → {effective_ratio:.2f})"
             )
             return stretched
 
         # Gap borrowing not enough — stretch to 1.5x hard cap, then trim
         safe_target_ms = int(tts_ms / 1.50)
-        stretched = advanced_time_stretch_v2(tts_audio, safe_target_ms)
+        stretched = advanced_time_stretch(tts_audio, safe_target_ms)
         trimmed = stretched[:available_ms]
         logging.warning(
-            f"[fit_tts_to_slot] seg {segment_index}: overflow capped at 1.50x, "
+            f"[TTS_FIT] seg {segment_index}: overflow capped at 1.50x, "
             f"trimmed {len(stretched)}ms -> {available_ms}ms"
         )
         return trimmed
@@ -1040,13 +907,13 @@ def fit_tts_to_slot(
                 duration=silence_ms, frame_rate=tts_audio.frame_rate
             )
         logging.info(
-            f"[fit_tts_to_slot] seg {segment_index}: underflow — "
+            f"[TTS_FIT] seg {segment_index}: underflow — "
             f"padding {silence_ms}ms silence (ratio={ratio:.2f})"
         )
         return padded
 
     # 0.75–0.90: gentle stretch
-    return advanced_time_stretch_v2(tts_audio, available_ms)
+    return advanced_time_stretch(tts_audio, available_ms)
 
 
 # --- Segment Processing and Synchronization ---
@@ -1084,7 +951,7 @@ def process_segment(
     tts_output_path = os.path.join(segments_dir, f"segment_{i:04d}.wav")
 
 
-    # Phase 1c: use word-level start for more precise overlay position
+    # Use word-level start for more precise overlay position.
     words = segment.get("words", [])
     word_starts = [w["start"] for w in words if w.get("start") is not None]
     if word_starts:
@@ -1178,7 +1045,7 @@ def adaptive_segment_processing(
 
 
 # ---------------------------------------------------------------------------
-# Phase 1c — Word-level speech intervals
+# Word-level speech intervals
 # ---------------------------------------------------------------------------
 
 def build_speech_intervals(
@@ -1228,7 +1095,7 @@ def build_speech_intervals(
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 — Demucs source separation
+# Demucs source separation
 # ---------------------------------------------------------------------------
 
 def separate_vocals_from_audio(
@@ -1245,10 +1112,10 @@ def separate_vocals_from_audio(
     Requires ~3GB VRAM on GPU; automatically falls back to overlap-add on CPU.
     """
     if device_obj.type == "cuda":
-        logging.info(f"[Demucs] Using GPU: {torch.cuda.get_device_name(device_obj)}")
+        logging.info(f"[DEMUCS] Using GPU: {torch.cuda.get_device_name(device_obj)}")
     else:
-        logging.info("[Demucs] Using CPU (no GPU available — separation will be slower)")
-    logging.info(f"[Demucs] Separating vocals from {audio_path} using {model_name!r}...")
+        logging.info("[DEMUCS] Using CPU (no GPU available — separation will be slower)")
+    logging.info(f"[DEMUCS] Separating vocals from {audio_path} using {model_name!r}...")
     demucs_model = demucs_get_model(model_name)
     device_str = str(device_obj).split(":")[0]
     demucs_model.to(device_obj)
@@ -1284,146 +1151,11 @@ def separate_vocals_from_audio(
     del demucs_model, sources, wav
     gc.collect()
     gpu_optimizer.clear_cache()
-    logging.info(f"[Demucs] Saved vocals → {vocals_path}, background → {background_path}")
+    logging.info(f"[DEMUCS] Saved vocals → {vocals_path}, background → {background_path}")
     return vocals_path, background_path
 
 
-# ---------------------------------------------------------------------------
-# Phase 4 / Issue 12 — Crossfades at silence boundaries
-# ---------------------------------------------------------------------------
-
-def insert_silence_with_fades(
-    audio_before: AudioSegment,
-    silence_ms: int,
-    audio_after: AudioSegment,
-    fade_ms: int = BOUNDARY_FADE_MS,
-) -> Tuple[AudioSegment, AudioSegment, AudioSegment]:
-    """Returns (faded_audio_before, silence, faded_audio_after) with crossfades.
-
-    Applies a fade_out to *audio_before* and a fade_in to *audio_after* so the
-    transitions into / out of silence don't produce pops or clicks.
-    Clamped so fades never exceed half the silence duration or either segment.
-    ([PLAN_h.md L993–L1005](PLAN_h.md))
-    """
-    silence = AudioSegment.silent(
-        duration=max(0, silence_ms),
-        frame_rate=audio_before.frame_rate if len(audio_before) > 0 else audio_after.frame_rate,
-    )
-    if silence_ms <= 0:
-        return audio_before, silence, audio_after
-
-    fade = min(
-        fade_ms,
-        len(audio_before),
-        silence_ms // 2,
-        len(audio_after),
-    )
-    if fade <= 0:
-        return audio_before, silence, audio_after
-
-    audio_before = audio_before.fade_out(fade)
-    audio_after = audio_after.fade_in(fade)
-    return audio_before, silence, audio_after
-
-
-def preserve_sound_effects(original_audio: AudioSegment,
-                           synced_speech_track: AudioSegment,
-                           transcript: dict,
-                           project_dir: str,
-                           silence_original_speech_segments: bool = True,
-                           duck_gain_db: Optional[float] = DUCKING_GAIN_DB) -> AudioSegment:
-    
-    debug_audio_dir = os.path.join(project_dir, 'audio_debug') # Already created by create_project_structure
-    logging.info(f"Mixing audio. Silence original: {silence_original_speech_segments}. Duck gain: {duck_gain_db}dB")
-
-    # Determine target channels (prefer stereo if either track is stereo)
-    target_channels = 2 if original_audio.channels == 2 or synced_speech_track.channels == 2 else 1
-    
-    # Standardize channels
-    working_original = original_audio.set_channels(target_channels)
-    working_synced_speech = synced_speech_track.set_channels(target_channels)
-    
-    working_original.export(os.path.join(debug_audio_dir, "0_original_standardized.wav"), format="wav")
-    working_synced_speech.export(os.path.join(debug_audio_dir, "0_synced_speech_standardized.wav"), format="wav")
-
-    # Create the base for the original audio (background) track
-    background_track = AudioSegment.empty()
-    
-    # Phase 1c: use word-level speech intervals with padding
-    speech_intervals_ms = build_speech_intervals(transcript)
-
-    if silence_original_speech_segments:
-        logging.info("Reconstructing original audio with speech segments silenced (12ms crossfades at boundaries).")
-        # Pre-collect (audio_before, silence_ms) pairs so we can apply fade_in to audio_after
-        parts_audio: List[AudioSegment] = []
-        parts_silence_ms: List[int] = []
-        last_end = 0
-        for start_ms, end_ms in speech_intervals_ms:
-            chunk = working_original[last_end:start_ms] if start_ms > last_end else AudioSegment.silent(0, frame_rate=working_original.frame_rate)
-            parts_audio.append(chunk)
-            parts_silence_ms.append(max(0, end_ms - start_ms))
-            last_end = end_ms
-        tail = working_original[last_end:] if last_end < len(working_original) else AudioSegment.silent(0, frame_rate=working_original.frame_rate)
-
-        for i in range(len(parts_audio)):
-            audio_before = parts_audio[i].set_channels(working_original.channels)
-            sil_ms = parts_silence_ms[i]
-            audio_after = (parts_audio[i + 1] if i + 1 < len(parts_audio) else tail).set_channels(working_original.channels)
-
-            faded_before, silence, faded_after = insert_silence_with_fades(audio_before, sil_ms, audio_after)
-            background_track += faded_before
-            if sil_ms > 0:
-                background_track += silence.set_channels(working_original.channels)
-            # Propagate the fade_in so the next iteration's audio_before is already faded
-            if i + 1 < len(parts_audio):
-                parts_audio[i + 1] = faded_after
-            else:
-                tail = faded_after
-
-        if len(tail) > 0:
-            background_track += tail.set_channels(working_original.channels)
-
-        # Ensure correct length
-        if len(background_track) < len(working_original):
-            padding = AudioSegment.silent(duration=len(working_original) - len(background_track), frame_rate=working_original.frame_rate).set_channels(working_original.channels)
-            background_track += padding
-        elif len(background_track) > len(working_original):
-            background_track = background_track[:len(working_original)]
-        background_track.export(os.path.join(debug_audio_dir, "1_background_AFTER_silencing.wav"), format="wav")
-
-    elif duck_gain_db is not None:
-        logging.info(f"Applying ducking with gain {duck_gain_db}dB to original audio during speech.")
-        background_track = working_original.dup() # Start with a copy
-        for start_ms, end_ms in speech_intervals_ms:
-            # Apply ducking with crossfades for smoother transitions
-            # The segment to duck is from original audio
-            segment_to_duck = background_track[start_ms:end_ms]
-            ducked_segment = segment_to_duck.apply_gain(duck_gain_db)
-            
-            # Simple overlay for ducking (no crossfade here, pydub's gain is instant)
-            # For crossfaded ducking, one would need to manage segments and fades more manually.
-            background_track = background_track.overlay(ducked_segment, position=start_ms)
-        background_track.export(os.path.join(debug_audio_dir, "1_background_AFTER_ducking.wav"), format="wav")
-    else:
-        background_track = working_original # No silencing or ducking
-        background_track.export(os.path.join(debug_audio_dir, "1_background_NO_OP.wav"), format="wav")
-
-    logging.info(f"Overlaying translated speech (len: {len(working_synced_speech)/1000:.2f}s) "
-                 f"onto background (len: {len(background_track)/1000:.2f}s)")
-    
-    # Final mix: overlay translated speech onto the processed background track
-    final_mix = background_track.overlay(working_synced_speech, position=0, loop=False, times=1) # position=0 assumes synced_speech_track is already timed correctly
-    
-    # Ensure final mix is not longer than original (can happen with slight timing issues)
-    if len(final_mix) > len(working_original):
-        final_mix = final_mix[:len(working_original)]
-
-    final_mix.export(os.path.join(debug_audio_dir, "2_final_mixed_audio.wav"), format="wav")
-    logging.info(f"Audio mixing complete. Final duration: {len(final_mix)/1000:.2f}s")
-    return final_mix
-
-
-def preserve_sound_effects_v2(
+def preserve_sound_effects(
     original_audio: AudioSegment,
     synced_speech_track: AudioSegment,
     transcript: dict,
@@ -1431,7 +1163,7 @@ def preserve_sound_effects_v2(
     device_obj,  # torch.device
 ) -> AudioSegment:
     """
-    Phase 2: Demucs-based audio mixer.
+    Demucs-based audio mixer.
 
     Strategy:
     1. Separate original audio into vocals + background (Demucs htdemucs_ft)
@@ -1450,10 +1182,10 @@ def preserve_sound_effects_v2(
     if os.path.exists(_pre_vocals) and os.path.exists(_pre_bg):
         vocals_path = _pre_vocals
         bg_path     = _pre_bg
-        logging.info("[preserve_v2] Reusing pre-computed Demucs stems (A1 lifecycle).")
+        logging.info("[MIX] Reusing pre-computed Demucs stems (A1 lifecycle).")
     else:
         logging.warning(
-            "[preserve_v2] Demucs stems not found at expected paths — running separation now. "
+            "[MIX] Demucs stems not found at expected paths — running separation now. "
             "This means Demucs is loading while other models may still occupy VRAM (A1 violated)."
         )
         vocals_path, bg_path = separate_vocals_from_audio(
@@ -1483,8 +1215,8 @@ def preserve_sound_effects_v2(
     final_mix = final_mix.overlay(tts_track, position=0)
     final_mix = final_mix[:len(original_audio)]
 
-    final_mix.export(os.path.join(debug_dir, "2_final_mixed_v2.wav"), format="wav")
-    logging.info(f"[preserve_v2] Final mix duration: {len(final_mix)/1000:.2f}s")
+    final_mix.export(os.path.join(debug_dir, "2_final_mixed.wav"), format="wav")
+    logging.info(f"[MIX] Final mix duration: {len(final_mix)/1000:.2f}s")
     return final_mix
 
 
@@ -1530,32 +1262,11 @@ def create_synced_audio_track(
             logging.error(f"Error overlaying segment from {audio_filepath}: {e}", exc_info=True)
             
     full_synced_speech_track = enhance_voice(full_synced_speech_track)
-    logging.info("[enhance_voice] Applied once globally to synced speech track.")
+    logging.info("[ENHANCE] Applied once globally to synced speech track.")
     return full_synced_speech_track
 
 
-def create_final_video(video_path: str, final_audio_path: str, output_path: str):
-    logging.info(f"Creating final video: {output_path}")
-    video_clip = None
-    audio_clip_obj = None
-    final_video_clip = None
-    try:
-        video_clip = VideoFileClip(video_path)
-        audio_clip_obj = AudioFileClip(final_audio_path)
-        final_video_clip = video_clip.set_audio(audio_clip_obj)
-        # Use more threads for potentially faster writing, and a progress bar.
-        final_video_clip.write_videofile(output_path, audio_codec='aac', threads=os.cpu_count() or 4, logger='bar')
-    except Exception as e:
-        logging.error(f"Failed to create final video: {e}", exc_info=True)
-        raise
-    finally:
-        if video_clip: video_clip.close()
-        if audio_clip_obj: audio_clip_obj.close()
-        if final_video_clip: final_video_clip.close() # MoviePy clips often need explicit close
-        del video_clip, audio_clip_obj, final_video_clip; gc.collect()
-
-
-def create_final_video_ffmpeg(video_path: str, audio_path: str, output_path: str) -> None:
+def create_final_video(video_path: str, audio_path: str, output_path: str) -> None:
     """Replace audio track using FFmpeg stream-copy — 10–50× faster than moviepy.
 
     Video stream is copied without re-encoding (-c:v copy).  Audio is encoded
@@ -1563,7 +1274,7 @@ def create_final_video_ffmpeg(video_path: str, audio_path: str, output_path: str
 
     Raises:
         RuntimeError: if ffmpeg is not in $PATH or if the FFmpeg process fails.
-    ([PLAN_h.md L1013–L1031](PLAN_h.md) — Issue 13)
+    ([PLAN_h.md L1013–L1031](PLAN_h.md))
     """
     if not shutil.which("ffmpeg"):
         raise RuntimeError(
@@ -1582,14 +1293,14 @@ def create_final_video_ffmpeg(video_path: str, audio_path: str, output_path: str
         "-shortest",       # trim to the shorter of video/audio
         output_path,
     ]
-    logging.info(f"[FFmpeg] Running: {' '.join(cmd)}")
+    logging.info(f"[FFMPEG] Running: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        logging.error(f"[FFmpeg] stderr: {result.stderr}")
+        logging.error(f"[FFMPEG] stderr: {result.stderr}")
         raise RuntimeError(
             f"FFmpeg failed (rc={result.returncode}):\n{result.stderr[-500:]}"
         )
-    logging.info(f"[FFmpeg] Final video created: {output_path}")
+    logging.info(f"[FFMPEG] Final video created: {output_path}")
 
 
 # --- Main Processing Function ---
@@ -1619,7 +1330,7 @@ def process_video(
     performance_monitor.log_gpu_status_direct()
     output_video_path = None  # Initialize
 
-    # Phase 4 / Issue 8: apply config.yaml parameter overrides (caller args take precedence
+    # Apply config.yaml parameter overrides (caller args take precedence
     # only when they differ from defaults; config provides non-default fallbacks).
     tts_mode = APP_CONFIG.get("tts_mode", tts_mode) or tts_mode
     qwen3_model_size = APP_CONFIG.get("qwen3_model_size", qwen3_model_size) or qwen3_model_size
@@ -1653,13 +1364,13 @@ def process_video(
                 _demucs_model_name = APP_CONFIG.get("demucs_model") or (
                     "htdemucs_ft" if hw_tier_early == "gpu_high" else "htdemucs"
                 )
-                logging.info(f"[A1] Hardware tier: {hw_tier_early} → Demucs model: {_demucs_model_name}")
+                logging.info(f"[LIFECYCLE] Hardware tier: {hw_tier_early} → Demucs model: {_demucs_model_name}")
                 separate_vocals_from_audio(
                     extracted_audio_path, project_dir, device, model_name=_demucs_model_name
                 )
                 # separate_vocals_from_audio deletes the Demucs model internally and calls
                 # gpu_optimizer.clear_cache() — VRAM is freed here before Whisper loads.
-                logging.info("[A1] Demucs unloaded. VRAM freed before transcription.")
+                logging.info("[LIFECYCLE] Demucs unloaded. VRAM freed before transcription.")
 
             # 3. Transcription
             with performance_monitor.timer("transcription"):
@@ -1680,7 +1391,7 @@ def process_video(
 
             # 4. Translation — NLLB-200 (load → batch translate all segments → unload before TTS)
             with performance_monitor.timer("translation_model_loading"):
-                # Phase 4 / Issue 8: respect config.yaml hardware_tier override
+                # Respect config.yaml hardware_tier override.
                 # hw_tier_early was already resolved in step 2; reuse it.
                 hw_tier = hw_tier_early
                 logging.info(f"Hardware tier: {hw_tier}")
@@ -1692,7 +1403,7 @@ def process_video(
                     min_ms=MIN_SEGMENT_MS,
                 )
                 logging.info(
-                    f"[merge] {len(transcript_data.get('segments', []))} -> {len(merged_input_segments)} "
+                    f"[MERGE] {len(transcript_data.get('segments', []))} -> {len(merged_input_segments)} "
                     f"segments after short-segment merge"
                 )
 
@@ -1711,7 +1422,7 @@ def process_video(
                 with open(translated_text_path, 'w', encoding='utf-8') as f:
                     f.write(full_translated_text)
 
-                # Issue 11: timing budget pre-screen
+                # Timing budget pre-screen.
                 translation_texts = [s['translated_text'] for s in translated_segments]
                 timing_budget = analyze_segment_timing_budget(
                     merged_input_segments, translation_texts, target_language_code
@@ -1840,9 +1551,9 @@ def process_video(
                     )
                 # tts_engine.__exit__ fires here: models unloaded, VRAM freed
 
-            # 6. Preserve Sound Effects & Mix Audio (Phase 2: Demucs-based stem reuse)
+            # 6. Preserve sound effects and mix audio (Demucs stem reuse)
             with performance_monitor.timer("audio_mixing_with_effects"):
-                final_mixed_audio_segment = preserve_sound_effects_v2(
+                final_mixed_audio_segment = preserve_sound_effects(
                     original_audio_segment,
                     synced_translated_speech_track,
                     transcript_data,
@@ -1854,11 +1565,11 @@ def process_video(
             logging.info(f"Exporting final mixed audio to: {final_audio_output_path}")
             final_mixed_audio_segment.export(final_audio_output_path, format="wav")
 
-            # 7. Create Final Video (Phase 4 / Issue 13: FFmpeg stream-copy)
+            # 7. Create final video (FFmpeg stream-copy)
             with performance_monitor.timer("final_video_creation"):
                 base_video_name = os.path.splitext(os.path.basename(video_path))[0]
                 output_video_path = os.path.join(project_dir, f"{base_video_name}_translated_{target_language_code}.mp4")
-                create_final_video_ffmpeg(video_path, final_audio_output_path, output_video_path)
+                create_final_video(video_path, final_audio_output_path, output_video_path)
 
             logging.info(f"Translation complete. Output video: {output_video_path}")
 

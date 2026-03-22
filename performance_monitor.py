@@ -5,7 +5,6 @@ import time
 import psutil
 import logging
 from contextlib import contextmanager
-import functools
 
 # Attempt to import gpu_optimizer from the gpu_config module.
 # This assumes gpu_config.py is in the same directory or Python path.

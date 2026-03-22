@@ -1,5 +1,5 @@
 """
-tts_engine.py — Unified TTS interface (Phase 2, Issues 4 & 9)
+tts_engine.py — Unified TTS interface
 
 Supports:
   - MeloTTS    (fast, preset voices, multi-speaker)
@@ -22,7 +22,6 @@ Usage (manual lifecycle):
 
 import gc
 import logging
-import os
 from typing import Dict, Optional
 
 import torch
@@ -64,10 +63,10 @@ except ImportError:
     _SF_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
-# Speaker registry (Issue 4a)
+# Speaker registry
 # ---------------------------------------------------------------------------
 
-# Default generation kwargs for Qwen3-TTS (Fix D).
+# Default generation kwargs for Qwen3-TTS.
 # Without do_sample=True the model uses greedy decoding which produces flat,
 # monotonic, robotic speech. These match the values from official examples.
 _QWEN_GEN_DEFAULTS: dict = dict(
@@ -112,7 +111,7 @@ def get_all_speaker_ids(melo_instance) -> Dict[str, int]:
 
 
 # ---------------------------------------------------------------------------
-# TTSEngine (Issues 4b & 9)
+# TTSEngine
 # ---------------------------------------------------------------------------
 
 class TTSEngine:
@@ -157,7 +156,7 @@ class TTSEngine:
         """Load (or hot-reload) MeloTTS for *language* (e.g. ``"EN"``, ``"FR"``).
 
         No-op when the requested language is already loaded. Re-loads and frees
-        the old model when the language changes (Issue 9 — prevents wrong-language
+        the old model when the language changes (prevents wrong-language
         phonemes when target language changes between calls).
         """
         if not _MELO_AVAILABLE:
@@ -204,7 +203,7 @@ class TTSEngine:
         logging.info(
             f"TTSEngine: loading Qwen3-TTS '{model_id}' on device='{device_str}' with dtype='{dtype}'"
         )
-        # Fix G: Flash Attention 2 significantly reduces VRAM and speeds up inference.
+        # Flash Attention 2 significantly reduces VRAM and speeds up inference.
         # Requires: pip install flash-attn
         extra_kwargs: dict = {}
         if device_str.startswith("cuda"):
@@ -227,7 +226,7 @@ class TTSEngine:
         logging.info("TTSEngine: Qwen3-TTS ready.")
 
     # ------------------------------------------------------------------
-    # Voice cloning (Issue 4c helper)
+    # Voice cloning helpers
     # ------------------------------------------------------------------
 
     def extract_voice_embedding(
@@ -256,7 +255,7 @@ class TTSEngine:
         logging.info(
             f"TTSEngine: extracting voice embedding from '{reference_audio_path}'"
         )
-        # Fix E: ICL mode (x_vector_only_mode=False) requires non-empty ref_text.
+        # ICL mode (x_vector_only_mode=False) requires non-empty ref_text.
         # Auto-switch to x-vector-only when no transcript is provided.
         use_icl = bool(reference_text and reference_text.strip())
         self._reference_embedding = self._qwen.create_voice_clone_prompt(
@@ -361,11 +360,11 @@ class TTSEngine:
         kwargs = dict(text=text, language=qwen_language)
         try:
             if self._reference_embedding is not None:
-                # Fix F: generate_voice_clone does not accept instruct — style
+                # generate_voice_clone does not accept instruct — style
                 # is controlled by the reference audio in ICL/x-vector mode.
                 if pace_instruct != "speak at a natural pace":
                     logging.info(
-                        "[Qwen3-TTS] Pace instruction ignored for voice-clone (style "
+                        "[QWEN3_TTS] Pace instruction ignored for voice-clone (style "
                         "is set by reference audio, not instruct text)."
                     )
                 wavs, sr = self._qwen.generate_voice_clone(

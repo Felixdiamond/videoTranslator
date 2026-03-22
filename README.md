@@ -178,9 +178,9 @@ Without Qwen3-TTS the pipeline stays on `melo` or `gtts` and voice cloning is un
 
 ---
 
-## Kaggle (recommended for new users)
+## Kaggle
 
-Use **only** `videotranslator.ipynb` in this repository. Other older Kaggle notebooks/scripts are considered outdated.
+Use [This notebook](https://www.kaggle.com/code/felixdiamond/videotranslator)
 
 Kaggle session settings:
 - `accelerator: T4 x 2`
