@@ -118,14 +118,14 @@ async def get_options():
     return {
         "languages": languages,
         "ttsModes": [
-            {"value": "melo", "label": "MeloTTS"},
             {"value": "qwen3", "label": "Qwen3-TTS"},
+            {"value": "melo", "label": "MeloTTS"},
             {"value": "gtts", "label": "gTTS"},
         ],
         "qwen3ModelSizes": sorted(VALID_QWEN3_MODEL_SIZES),
         "meloSpeakerIdsByLanguage": MELO_SPEAKER_IDS_BY_LANGUAGE,
         "defaults": {
-            "ttsMode": "melo",
+            "ttsMode": "qwen3",
             "qwen3ModelSize": "1.7B",
             "enableVoiceCloning": True,
         },
@@ -166,7 +166,7 @@ async def translate_video_ws(
     websocket: WebSocket,
     video_path: str,
     target_language: str,
-    tts_mode: str = "melo",
+    tts_mode: str = "qwen3",
     qwen3_model_size: str = "1.7B",
     speaker_id: Optional[str] = None,
     enable_voice_cloning: bool = True,

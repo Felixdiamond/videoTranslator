@@ -54,8 +54,8 @@ const FALLBACK_OPTIONS: OptionsResponse = {
     { code: "pt", label: "Portuguese", supportsMelo: false },
   ],
   ttsModes: [
-    { value: "melo", label: "MeloTTS" },
     { value: "qwen3", label: "Qwen3-TTS" },
+    { value: "melo", label: "MeloTTS" },
     { value: "gtts", label: "gTTS" },
   ],
   qwen3ModelSizes: ["0.6B", "1.7B"],
@@ -68,7 +68,7 @@ const FALLBACK_OPTIONS: OptionsResponse = {
     ko: ["KR"],
   },
   defaults: {
-    ttsMode: "melo",
+    ttsMode: "qwen3",
     qwen3ModelSize: "1.7B",
     enableVoiceCloning: true,
   },
@@ -108,7 +108,7 @@ export default function Home() {
 
   const [options, setOptions] = useState<OptionsResponse>(FALLBACK_OPTIONS);
   const [targetLanguage, setTargetLanguage] = useState("");
-  const [ttsMode, setTtsMode] = useState<"melo" | "qwen3" | "gtts">("melo");
+  const [ttsMode, setTtsMode] = useState<"melo" | "qwen3" | "gtts">("qwen3");
   const [qwen3ModelSize, setQwen3ModelSize] = useState("1.7B");
   const [enableVoiceCloning, setEnableVoiceCloning] = useState(true);
   const [meloSpeakerId, setMeloSpeakerId] = useState("");
@@ -136,7 +136,7 @@ export default function Home() {
 
         setOptions(data);
         setTargetLanguage((prev) => prev || data.languages[0]?.code || "");
-        setTtsMode(data.defaults?.ttsMode || "melo");
+        setTtsMode(data.defaults?.ttsMode || "qwen3");
         setQwen3ModelSize(data.defaults?.qwen3ModelSize || "1.7B");
         setEnableVoiceCloning(data.defaults?.enableVoiceCloning ?? true);
       } catch {

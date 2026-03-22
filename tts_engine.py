@@ -72,7 +72,7 @@ class TTSEngine:
 
     def __init__(
         self,
-        mode: str = "melo",
+        mode: str = "qwen3",
         device: str = "cpu",
         model_size: str = "1.7B",
         language_model_map: Optional[Dict] = None,
@@ -183,7 +183,7 @@ class TTSEngine:
         speaker_id: Optional[str] = None,
         instruct: str = "",
     ) -> None:
-                """Synthesize speech and write it to output_path."""
+        """Synthesize speech and write it to output_path."""
         if self.mode == "qwen3":
             if self._qwen is None:
                 raise RuntimeError(

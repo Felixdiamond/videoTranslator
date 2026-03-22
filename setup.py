@@ -166,21 +166,21 @@ def setup_frontend(project_root):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Bootstrap videoTranslator. whisperX is always installed. MeloTTS is installed by default; use --qwen3 to add or replace it."
+        description="Bootstrap videoTranslator. whisperX and Qwen3-TTS are installed by default; add --melo to install MeloTTS as an additional engine."
     )
-    parser.add_argument("--melo", action="store_true", default=True, help="Install Felixdiamond/MeloTTS (default TTS engine, on by default).")
-    parser.add_argument("--no-melo", dest="melo", action="store_false", help="Skip MeloTTS install.")
-    parser.add_argument("--qwen3", action="store_true", help="Also install Qwen3-TTS (enables voice cloning).")
+    parser.add_argument("--qwen3", action="store_true", default=True, help="Install Qwen3-TTS (primary TTS engine, on by default).")
+    parser.add_argument("--no-qwen3", dest="qwen3", action="store_false", help="Skip Qwen3-TTS install.")
+    parser.add_argument("--melo", action="store_true", help="Also install Felixdiamond/MeloTTS.")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     tts = set()
-    if args.melo:
-        tts.add("melo")
     if args.qwen3:
         tts.add("qwen3")
+    if args.melo:
+        tts.add("melo")
 
     project_root = os.path.dirname(os.path.abspath(__file__))
     os.chdir(project_root)
@@ -194,10 +194,10 @@ def main():
     setup_frontend(project_root)
 
     pip_executable = get_pip_executable(venv_dir)
-    if "melo" in tts:
-        setup_melo_tts(project_root, pip_executable)
     if "qwen3" in tts:
         setup_qwen3_tts(project_root, pip_executable)
+    if "melo" in tts:
+        setup_melo_tts(project_root, pip_executable)
 
     print("\nSetup complete.")
     print("\nNext Steps:")

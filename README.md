@@ -7,7 +7,7 @@ This project has grown from a simple script into a full stack workflow:
 - FastAPI + WebSocket service (`server.py`)
 - Next.js frontend (`video-translator/`)
 - Hardware-aware model selection + config overrides (`config.yaml`)
-- Multi-engine TTS (`MeloTTS` as primary, `Qwen3-TTS` for **voice cloning**, `gTTS` fallback)
+- Multi-engine TTS (`Qwen3-TTS` as primary, `MeloTTS` optional, `gTTS` fallback)
 
 ---
 
@@ -17,8 +17,8 @@ This project has grown from a simple script into a full stack workflow:
 - **ASR + alignment**: WhisperX with faster-whisper backend + forced alignment for tighter word timing.
 - **Translation**: NLLB-200 model family with hardware-tiered model selection.
 - **Speech synthesis**: Unified `TTSEngine` routing between:
-  - `melo` — default, good multilingual quality
-  - `qwen3` — **voice cloning**: clones the original speaker's voice into the target language
+  - `qwen3` — primary engine with **voice cloning** support
+  - `melo` — optional alternative engine
   - `gtts` (fallback)
 - **Audio quality controls**:
   - Demucs vocal/background separation
@@ -66,7 +66,7 @@ The full 28-minute video wasn't translated as it would take a significant amount
 ```text
 videoTranslator/
 ├── translator.py           # End-to-end dubbing pipeline
-├── tts_engine.py           # Unified TTS backend (Melo/Qwen3/gTTS)
+├── tts_engine.py           # Unified TTS backend (Qwen3/Melo/gTTS)
 ├── server.py               # FastAPI upload + WebSocket translation endpoints
 ├── run.py                  # Starts backend + frontend together
 ├── setup.py                # Bootstrap helper (venv, deps, frontend)
@@ -86,7 +86,8 @@ videoTranslator/
 - FFmpeg in `PATH`
 - `rubberband-cli` installed (required by `pyrubberband`)
 - CUDA GPU recommended for speed (CPU works, slower)
-- Melo backend source: `https://github.com/Felixdiamond/MeloTTS` (modified for python 3.12 support)
+- Qwen3-TTS source: `https://github.com/QwenLM/Qwen3-TTS`
+- Melo backend source (optional): `https://github.com/Felixdiamond/MeloTTS` (modified for python 3.12 support)
 
 Linux helper packages (example):
 
@@ -107,26 +108,26 @@ cd videoTranslator
 python setup.py
 ```
 
-This installs base Python dependencies, whisperX, MeloTTS (default TTS), and the frontend. TTS selection is opt-in:
+This installs base Python dependencies, whisperX, Qwen3-TTS (primary TTS), and the frontend. MeloTTS is optional.
 
 | Flag | Effect |
 |------|--------|
-| *(default)* | whisperX + MeloTTS |
-| `--no-melo` | skip MeloTTS (use `gTTS` fallback only) |
-| `--qwen3` | also install Qwen3-TTS (adds **voice cloning**) |
-| `--no-melo --qwen3` | whisperX + Qwen3-TTS only |
+| *(default)* | whisperX + Qwen3-TTS |
+| `--melo` | also install MeloTTS |
+| `--no-qwen3` | skip Qwen3-TTS |
+| `--no-qwen3 --melo` | MeloTTS-only install |
 
 Examples:
 
 ```bash
-# default — whisperX + MeloTTS
+# default — whisperX + Qwen3-TTS
 python setup.py
 
-# MeloTTS + voice cloning
-python setup.py --qwen3
+# Qwen3-TTS + MeloTTS
+python setup.py --melo
 
-# Qwen3-TTS only (skip MeloTTS)
-python setup.py --no-melo --qwen3
+# MeloTTS only (skip Qwen3-TTS)
+python setup.py --no-qwen3 --melo
 ```
 
 > whisperX is always installed — it is required for ASR alignment.
@@ -147,16 +148,9 @@ Then install the frontend (optional if CLI or Server only):
 cd video-translator && npm install && cd ..
 ```
 
-#### MeloTTS (default TTS engine)
+#### Qwen3-TTS (primary TTS engine)
 
-```bash
-pip install git+https://github.com/Felixdiamond/MeloTTS.git
-python -m unidic download
-```
-
-#### Qwen3-TTS (optional — required for voice cloning)
-
-Install this if you want the pipeline to clone the original speaker's voice into the target language.
+Install this for the recommended default path with voice cloning support.
 
 ```bash
 sudo apt-get install sox
@@ -167,6 +161,13 @@ sed -i 's/transformers==4.57.3/transformers>=4.47.1/' /tmp/qwen3tts/pyproject.to
 pip install -e /tmp/qwen3tts
 ```
 
+#### MeloTTS (optional alternative engine)
+
+```bash
+pip install git+https://github.com/Felixdiamond/MeloTTS.git
+python -m unidic download
+```
+
 Then in `config.yaml`:
 
 ```yaml
@@ -174,7 +175,7 @@ tts_mode: qwen3
 enable_voice_cloning: true
 ```
 
-Without Qwen3-TTS the pipeline stays on `melo` or `gtts` and voice cloning is unavailable.
+Without Qwen3-TTS the pipeline can use `melo` or `gtts`, but voice cloning is unavailable.
 
 ---
 
@@ -189,7 +190,7 @@ Kaggle session settings:
 Minimal Kaggle run flow:
 1. Open `videotranslator.ipynb` in Kaggle.
 2. Run cells in order.
-3. Keep TTS mode on `melo`.
+3. Keep TTS mode on `qwen3`.
 4. Run translation cell with your input video path and target language.
 
 The notebook includes Kaggle-specific setup quirks handling (dependency pin relaxations and install order) to reduce environment breakage on latest images.
@@ -260,13 +261,17 @@ Useful keys:
 - `hardware_tier`: `auto | cpu_low | cpu_high | gpu_low | gpu_medium | gpu_high`
 - `whisper_model`
 - `translation_model`
-- `tts_mode`: `melo | qwen3 | gtts`
+- `tts_mode`: `qwen3 | melo | gtts`
 - `qwen3_model_size`: `0.6B | 1.7B`
 - `enable_voice_cloning`: `true | false`
 - `melo_speaker_id`
 - `demucs_model`
 
-If you want Qwen3 voice cloning by default, set:
+Melo-only timing note:
+- `CPS_MAP` in `translator.py` is used only for Melo pacing heuristics.
+- `estimate_ideal_tts_speed(...)` is Melo-only logic and is ignored when `tts_mode` is `qwen3` or `gtts`.
+
+Use this as the recommended default in `config.yaml`:
 
 ```yaml
 tts_mode: qwen3
@@ -306,7 +311,7 @@ qwen3_model_size: "1.7B"
 ### Translation WebSocket
 - `WS /translate/{video_path}/{target_language}`
 - Query params:
-  - `tts_mode` (default `melo`)
+  - `tts_mode` (default `qwen3`)
   - `qwen3_model_size` (`0.6B` or `1.7B`, default `1.7B`)
   - `speaker_id` (Melo speaker)
   - `enable_voice_cloning` (bool, default `true`)

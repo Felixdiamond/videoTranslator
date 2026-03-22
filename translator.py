@@ -780,7 +780,10 @@ def estimate_ideal_tts_speed(
     lang_code: str,
     tts_mode: str = "melo",
 ) -> float:
-    """Estimate MeloTTS speed to better fit segment duration."""
+    """Estimate playback speed for MeloTTS only.
+
+    For qwen3/gtts modes this returns 1.0 and has no effect.
+    """
     if tts_mode != "melo":
         return 1.0
     if lang_code not in CPS_MAP:
@@ -1184,7 +1187,7 @@ def create_final_video(video_path: str, audio_path: str, output_path: str) -> No
 def process_video(
     video_path: str,
     target_language_code: str,
-    tts_mode: str = "melo",
+    tts_mode: str = "qwen3",
     qwen3_model_size: str = "1.7B",
     melo_speaker_id: Optional[str] = None,
     enable_voice_cloning: bool = True,
@@ -1377,7 +1380,7 @@ def process_video(
                                     ref_audio = str(ref_sample["path"])
                                     ref_text = str(ref_sample.get("text") or "")
                                     tts_engine.extract_voice_embedding(ref_audio, ref_text)
-                        else:  # "melo" (default) or unrecognised mode
+                        else:  # "melo" or unrecognised mode
                             MELO_SUPPORTED = {"en", "es", "fr", "zh", "ja", "ko"}
                             if target_language_code not in MELO_SUPPORTED:
                                 logging.warning(
