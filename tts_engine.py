@@ -182,6 +182,7 @@ class TTSEngine:
         speed: float = 1.0,
         speaker_id: Optional[str] = None,
         instruct: str = "",
+        timing_ratio: float = 1.0,
     ) -> None:
         """Synthesize speech and write it to output_path."""
         if self.mode == "qwen3":
@@ -190,7 +191,15 @@ class TTSEngine:
                     "TTSEngine: Qwen3-TTS is not loaded. "
                     "Install it with: pip install -U qwen-tts"
                 )
-            self._synthesize_qwen3(text, language_code, output_path, speaker_id, instruct, speed)
+            self._synthesize_qwen3(
+                text,
+                language_code,
+                output_path,
+                speaker_id,
+                instruct,
+                speed,
+                timing_ratio,
+            )
         elif self.mode == "melo" and self._melo is not None:
             self._synthesize_melo(text, language_code, output_path, speed, speaker_id)
         else:
@@ -214,6 +223,25 @@ class TTSEngine:
             return "Auto"
         return lang_map.get(language_code.lower(), "Auto")
 
+    def _build_pace_instruct(self, timing_ratio: float) -> str:
+        """Return numeric-anchor pace instructions keyed to slot pressure.
+
+        timing_ratio = estimated_tts_ms / available_slot_ms.
+        > 1.0 means the translation tends to run long and needs a faster pace.
+        < 1.0 means it tends to run short and can be delivered slower.
+        """
+        if timing_ratio > 1.6:
+            return "speak at 1.5x normal speed, compress pauses, maintain clarity"
+        if timing_ratio > 1.3:
+            return "speak at 1.25x normal speed, clear articulation"
+        if timing_ratio > 1.1:
+            return "speak at 1.1x normal speed, slightly brisk"
+        if timing_ratio < 0.65:
+            return "speak at 0.7x normal speed, slow and deliberate with natural pauses"
+        if timing_ratio < 0.80:
+            return "speak at 0.85x normal speed, relaxed pace"
+        return "speak at a natural conversational pace"
+
     def _synthesize_qwen3(
         self,
         text: str,
@@ -222,28 +250,23 @@ class TTSEngine:
         speaker_id: Optional[str],
         instruct: str,
         speed: float = 1.0,
+        timing_ratio: float = 1.0,
     ) -> None:
         qwen_language = self._normalize_qwen_language(language_code)
 
-        if speed >= 1.3:
-            pace_instruct = "speak quickly and clearly"
-        elif speed <= 0.8:
-            pace_instruct = "speak slowly and clearly"
-        else:
-            pace_instruct = "speak at a natural pace"
+        pace_instruct = self._build_pace_instruct(timing_ratio)
 
         combined_instruct = f"{pace_instruct}. {instruct}".strip(". ") if instruct else pace_instruct
 
         kwargs = dict(text=text, language=qwen_language)
         try:
             if self._reference_embedding is not None:
-                if pace_instruct != "speak at a natural pace":
-                    logging.info(
-                        "[QWEN3_TTS] Pace instruction ignored for voice-clone (style "
-                        "is set by reference audio, not instruct text)."
-                    )
+                logging.info(
+                    f"[QWEN3_TTS] voice-clone synthesis with instruct='{combined_instruct}'"
+                )
                 wavs, sr = self._qwen.generate_voice_clone(
                     voice_clone_prompt=self._reference_embedding,
+                    instruct=combined_instruct,
                     **_QWEN_GEN_DEFAULTS,
                     **kwargs,
                 )
@@ -308,7 +331,8 @@ class TTSEngine:
                 f"TTSEngine: gTTS synthesis failed: {e}. Writing silent placeholder.",
                 exc_info=True,
             )
-            AudioSegment.silent(duration=100).export(output_path, format="wav")
+            # Sentinel duration consumed by process_segment to skip failed synthesis output.
+            AudioSegment.silent(duration=50, frame_rate=22050).export(output_path, format="wav")
 
     def get_speaker_ids(self) -> Dict[str, int]:
         """Return the active MeloTTS speaker-ID map."""

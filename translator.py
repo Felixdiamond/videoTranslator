@@ -271,6 +271,7 @@ def text_to_speech(
     tts_engine: Optional["TTSEngine"] = None,
     speed: float = 1.0,
     speaker_id: Optional[str] = None,
+    timing_ratio: float = 1.0,
 ) -> None:
     """Synthesise *text_to_synthesize* and write audio to *output_filepath*.
 
@@ -294,6 +295,7 @@ def text_to_speech(
                 output_filepath,
                 speed=speed,
                 speaker_id=speaker_id,
+                timing_ratio=timing_ratio,
             )
             return
         except Exception as e:
@@ -476,13 +478,30 @@ def translate_with_length_target(
     tokenizer,
     target_length_ratio: float = 1.0,
 ) -> str:
-    """Translate text with optional length bias."""
+    """Translate text with graduated length bias.
+
+    Each compression pass applies distinct beam/penalty settings so repeated
+    attempts can search genuinely shorter paraphrases.
+    """
     if not text.strip() or src_lang == tgt_lang:
         return text
-    length_penalty = 0.6 if target_length_ratio < 0.85 else 1.0
+
+    if target_length_ratio < 0.65:
+        length_penalty = 0.3
+        num_beams = 8
+    elif target_length_ratio < 0.75:
+        length_penalty = 0.4
+        num_beams = 8
+    elif target_length_ratio < 0.85:
+        length_penalty = 0.6
+        num_beams = 4
+    else:
+        length_penalty = 1.0
+        num_beams = 4
+
     return _translate_text_nllb(
         text, src_lang, tgt_lang, model, tokenizer,
-        num_beams=4, length_penalty=length_penalty,
+        num_beams=num_beams, length_penalty=length_penalty,
     )
 
 
@@ -565,11 +584,8 @@ def analyze_segment_timing_budget(
     return results
 
 
-def merge_short_segments(segments: List[dict], min_ms: int = MIN_SEGMENT_MS) -> List[dict]:
-    """Merge very short consecutive segments into a neighbor before translation/TTS."""
-    if not segments:
-        return segments
-
+def _merge_short_segments_single_pass(segments: List[dict], min_ms: int) -> List[dict]:
+    """One pass of short-segment merging."""
     merged: List[dict] = []
     i = 0
     while i < len(segments):
@@ -583,13 +599,20 @@ def merge_short_segments(segments: List[dict], min_ms: int = MIN_SEGMENT_MS) -> 
             next_start = float(next_seg.get("start", seg_end) or seg_end)
             next_end = float(next_seg.get("end", next_start) or next_start)
             combined_text = " ".join(
-                part for part in [str(seg.get("text", "")).strip(), str(next_seg.get("text", "")).strip()] if part
+                part
+                for part in [
+                    str(seg.get("text", "")).strip(),
+                    str(next_seg.get("text", "")).strip(),
+                ]
+                if part
             )
+            combined_words = list(seg.get("words") or []) + list(next_seg.get("words") or [])
             combined = {
                 **next_seg,
                 "start": min(seg_start, next_start),
                 "end": max(seg_end, next_end),
                 "text": combined_text,
+                "words": combined_words,
             }
             merged.append(combined)
             logging.info(
@@ -603,6 +626,20 @@ def merge_short_segments(segments: List[dict], min_ms: int = MIN_SEGMENT_MS) -> 
             i += 1
 
     return merged
+
+
+def merge_short_segments(segments: List[dict], min_ms: int = MIN_SEGMENT_MS) -> List[dict]:
+    """Merge very short consecutive segments iteratively until stable."""
+    if not segments:
+        return segments
+
+    max_passes = 5
+    for _ in range(max_passes):
+        before_count = len(segments)
+        segments = _merge_short_segments_single_pass(segments, min_ms)
+        if len(segments) == before_count:
+            break
+    return segments
 
 
 def split_translation_at_clauses(text: str) -> List[str]:
@@ -715,12 +752,18 @@ def load_translation_model(tier: str) -> Tuple:
     return trans_model, tokenizer
 
 def enhance_voice(audio: AudioSegment) -> AudioSegment:
-    """Apply light EQ, compression, and normalization."""
+    """Apply light EQ and compression globally to the speech track.
+
+    Normalization is intentionally per-segment in create_synced_audio_track.
+    """
     enhanced = audio.high_pass_filter(85) # Cut sub-bass rumble
-
-    enhanced = pydub_effects.compress_dynamic_range(enhanced, threshold=-18.0, ratio=3.0, attack=5.0, release=100.0)
-
-    enhanced = pydub_effects.normalize(enhanced, headroom=1.0)
+    enhanced = pydub_effects.compress_dynamic_range(
+        enhanced,
+        threshold=-18.0,
+        ratio=3.0,
+        attack=5.0,
+        release=100.0,
+    )
     return enhanced
 
 def advanced_time_stretch(audio: AudioSegment, target_duration_ms: int) -> AudioSegment:
@@ -749,9 +792,9 @@ def advanced_time_stretch(audio: AudioSegment, target_duration_ms: int) -> Audio
     sr = audio.frame_rate
 
     if audio.channels == 2:
-        samples_2ch = samples.reshape(-1, 2).T  # (2, n_samples)
+        samples_2ch = samples.reshape(-1, 2)  # (n_samples, 2) for pyrubberband
         stretched = pyrb.time_stretch(samples_2ch, sr, rate)
-        stretched = stretched.T.flatten()
+        stretched = stretched.flatten()
     else:
         stretched = pyrb.time_stretch(samples, sr, rate)
 
@@ -794,7 +837,7 @@ def estimate_ideal_tts_speed(
     estimated_duration_s = len(text) / cps
     target_duration_s = original_duration_ms / 1000.0
     ideal_speed = estimated_duration_s / target_duration_s
-    ideal_speed = float(np.clip(ideal_speed, 0.7, 1.4))
+    ideal_speed = float(np.clip(ideal_speed, 0.80, 1.25))
     logging.info(
         f"[TTS speed est] lang={lang_code!r} chars={len(text)} "
         f"est={estimated_duration_s:.2f}s target={target_duration_s:.2f}s speed={ideal_speed:.2f}"
@@ -806,67 +849,60 @@ def fit_tts_to_slot(
     tts_audio: AudioSegment,
     available_ms: int,
     segment_index: int,
-    next_gap_ms: int = 0,
+    next_gap_ms: int = 0,   # kept for API compatibility; borrowing removed
 ) -> AudioSegment:
-    """Fit synthesized speech to a segment slot with naturalness-first rules."""
+    """Fit synthesized speech strictly within the segment slot.
+
+    Gap borrowing has been removed to prevent overlap with following segments
+    during fixed-position overlay assembly.
+    """
     tts_ms = len(tts_audio)
     if available_ms <= 0:
         return tts_audio
 
     ratio = tts_ms / available_ms
 
-    if 0.90 <= ratio <= 1.10:
+    if 0.85 <= ratio <= 1.15:
         logging.info(f"[TTS_FIT] seg {segment_index}: natural fit ({ratio:.2f}), no adjustment")
         return tts_audio
 
-    STRETCH_FLOOR = 0.65
     STRETCH_CEIL  = 1.50
 
-    if ratio > 1.10:
-        max_effective_ms = int(tts_ms / STRETCH_FLOOR)   # floor constraint: rate can't go below 0.65
-        raw_effective_ms = available_ms + next_gap_ms
-        effective_ms = min(raw_effective_ms, max_effective_ms)
-        effective_ratio = tts_ms / effective_ms if effective_ms > 0 else ratio
-
-        if effective_ratio <= STRETCH_CEIL:
-            stretched = advanced_time_stretch(tts_audio, effective_ms)
-            actual_borrow = effective_ms - available_ms
+    if ratio > 1.15:
+        if ratio <= STRETCH_CEIL:
+            stretched = advanced_time_stretch(tts_audio, available_ms)
             logging.info(
-                f"[TTS_FIT] seg {segment_index}: borrowed {actual_borrow}ms "
-                f"from next gap (rate {ratio:.2f} → {effective_ratio:.2f})"
+                f"[TTS_FIT] seg {segment_index}: overflow compressed to slot (rate {ratio:.2f})"
             )
             return stretched
 
-        safe_target_ms = int(tts_ms / 1.50)
+        safe_target_ms = int(tts_ms / STRETCH_CEIL)
         stretched = advanced_time_stretch(tts_audio, safe_target_ms)
         trimmed = stretched[:available_ms]
         logging.warning(
-            f"[TTS_FIT] seg {segment_index}: overflow capped at 1.50x, "
-            f"trimmed {len(stretched)}ms -> {available_ms}ms"
+            f"[TTS_FIT] seg {segment_index}: overflow hard-trimmed at {STRETCH_CEIL}x, "
+            f"{len(stretched)}ms -> {available_ms}ms"
         )
         return trimmed
 
-    if ratio < 0.75:
-        silence_ms = max(0, available_ms - tts_ms)
-        if silence_ms > 400:
-            lead_ms = min(150, silence_ms // 4)
-            tail_ms = silence_ms - lead_ms
-            padded = (
-                AudioSegment.silent(duration=lead_ms, frame_rate=tts_audio.frame_rate)
-                + tts_audio
-                + AudioSegment.silent(duration=tail_ms, frame_rate=tts_audio.frame_rate)
-            )
-        else:
-            padded = tts_audio + AudioSegment.silent(
-                duration=silence_ms, frame_rate=tts_audio.frame_rate
-            )
-        logging.info(
-            f"[TTS_FIT] seg {segment_index}: underflow — "
-            f"padding {silence_ms}ms silence (ratio={ratio:.2f})"
+    silence_ms = max(0, available_ms - tts_ms)
+    if silence_ms > 400:
+        lead_ms = min(150, silence_ms // 4)
+        tail_ms = silence_ms - lead_ms
+        padded = (
+            AudioSegment.silent(duration=lead_ms, frame_rate=tts_audio.frame_rate)
+            + tts_audio
+            + AudioSegment.silent(duration=tail_ms, frame_rate=tts_audio.frame_rate)
         )
-        return padded
-
-    return advanced_time_stretch(tts_audio, available_ms)
+    else:
+        padded = tts_audio + AudioSegment.silent(
+            duration=silence_ms, frame_rate=tts_audio.frame_rate
+        )
+    logging.info(
+        f"[TTS_FIT] seg {segment_index}: underflow — "
+        f"padding {silence_ms}ms silence (ratio={ratio:.2f})"
+    )
+    return padded
 
 def process_segment(
     segment_info: Tuple[int, dict],
@@ -912,6 +948,7 @@ def process_segment(
             estimated_ms = int((len(translated_text) / cps) * 1000)
             estimated_ratio = estimated_ms / original_duration_ms if original_duration_ms > 0 else 1.0
         else:
+            # For qwen3/gtts no stable pre-synthesis CPS estimate is available.
             estimated_ratio = 1.0
 
         if estimated_ratio < 0.75 and original_duration_ms > 1200:
@@ -927,8 +964,57 @@ def process_segment(
             generated_audio.export(tts_output_path, format="wav")
         else:
             text_to_speech(translated_text, target_language_code, tts_output_path,
-                           tts_engine=tts_engine, speed=ideal_speed, speaker_id=speaker_id)
+                           tts_engine=tts_engine, speed=ideal_speed, speaker_id=speaker_id,
+                           timing_ratio=estimated_ratio)
             generated_audio = AudioSegment.from_file(tts_output_path)
+
+        # Guard against sentinel placeholder produced by gTTS failure.
+        placeholder_sentinel_ms = 50
+        if len(generated_audio) <= placeholder_sentinel_ms:
+            logging.warning(
+                f"[SEG {i}] Skipping placeholder audio ({len(generated_audio)}ms) — TTS failed silently."
+            )
+            del generated_audio
+            gc.collect()
+            return None
+
+        # Qwen3 retry: if first output is far from slot timing, retry once with measured ratio.
+        if tts_mode_active == "qwen3" and original_duration_ms > 0:
+            actual_ms = len(generated_audio)
+            actual_ratio = actual_ms / original_duration_ms
+            retry_threshold = 0.25
+            if abs(actual_ratio - 1.0) > retry_threshold:
+                logging.info(
+                    f"[QWEN3_RETRY] seg {i}: actual_ratio={actual_ratio:.2f} "
+                    f"exceeds threshold={retry_threshold}, retrying with corrected ratio"
+                )
+                try:
+                    text_to_speech(
+                        translated_text,
+                        target_language_code,
+                        tts_output_path,
+                        tts_engine=tts_engine,
+                        speed=ideal_speed,
+                        speaker_id=speaker_id,
+                        timing_ratio=actual_ratio,
+                    )
+                    retry_audio = AudioSegment.from_file(tts_output_path)
+                    retry_ratio = len(retry_audio) / original_duration_ms
+                    if abs(retry_ratio - 1.0) < abs(actual_ratio - 1.0):
+                        logging.info(
+                            f"[QWEN3_RETRY] seg {i}: retry improved "
+                            f"{actual_ratio:.2f} -> {retry_ratio:.2f}"
+                        )
+                        generated_audio = retry_audio
+                    else:
+                        logging.info(
+                            f"[QWEN3_RETRY] seg {i}: retry did not improve "
+                            f"({actual_ratio:.2f} -> {retry_ratio:.2f}), keeping first attempt"
+                        )
+                except Exception as retry_err:
+                    logging.warning(
+                        f"[QWEN3_RETRY] seg {i}: retry failed ({retry_err}), keeping first attempt"
+                    )
 
         fitted_audio = fit_tts_to_slot(generated_audio, original_duration_ms, i, next_gap_ms=next_gap_ms)
         del generated_audio; gc.collect()
@@ -1067,8 +1153,13 @@ def preserve_sound_effects(
     transcript: dict,
     project_dir: str,
     device_obj,  # torch.device
+    tts_intervals: Optional[List[Tuple[int, int]]] = None,
 ) -> AudioSegment:
-    """Mix translated speech with Demucs-separated background."""
+    """Mix translated speech with Demucs-separated background.
+
+    When provided, tts_intervals should reflect actual TTS placement ranges
+    from create_synced_audio_track for precise ducking alignment.
+    """
     debug_dir = os.path.join(project_dir, "audio_debug")
     extracted_audio_path = os.path.join(project_dir, "audio", "extracted_audio.wav")
 
@@ -1093,9 +1184,14 @@ def preserve_sound_effects(
     target_channels = max(original_audio.channels, synced_speech_track.channels)
     background_seg = background_seg.set_channels(target_channels)
 
-    speech_intervals = build_speech_intervals(transcript)
+    if tts_intervals:
+        speech_intervals = sorted(tts_intervals)
+        logging.info(f"[MIX] Using {len(speech_intervals)} actual TTS placement intervals for ducking.")
+    else:
+        speech_intervals = build_speech_intervals(transcript)
+        logging.info("[MIX] Falling back to transcript-derived speech intervals for ducking.")
 
-    DUCK_DB   = -8.0
+    DUCK_DB   = DUCKING_GAIN_DB
     FADE_MS   = 80
     final_mix = background_seg
     for start_ms, end_ms in speech_intervals:
@@ -1121,8 +1217,8 @@ def create_synced_audio_track(
     project_dir: str,
     tts_engine: Optional["TTSEngine"],
     speaker_id: Optional[str] = None,
-) -> AudioSegment:
-    """Build a synced translated speech track from translated segments."""
+) -> Tuple[AudioSegment, List[Tuple[int, int]]]:
+    """Build a synced translated speech track and return placement intervals."""
     logging.info("Creating full synced translated speech track with segment fades...")
     target_channels = original_audio_ref.channels
 
@@ -1137,9 +1233,14 @@ def create_synced_audio_track(
         tts_engine, speaker_id,
     )
 
+    tts_intervals: List[Tuple[int, int]] = []
+
     for start_time_ms, audio_filepath in processed_segments_info:
         try:
             segment_audio = AudioSegment.from_file(audio_filepath).set_channels(target_channels)
+            segment_audio = pydub_effects.normalize(segment_audio, headroom=1.0)
+            seg_end_ms = start_time_ms + len(segment_audio)
+            tts_intervals.append((start_time_ms, seg_end_ms))
 
             if CROSSFADE_MS > 0:
                 fade_len = min(CROSSFADE_MS, len(segment_audio) // 2 if len(segment_audio) > 0 else 0)
@@ -1153,7 +1254,7 @@ def create_synced_audio_track(
             
     full_synced_speech_track = enhance_voice(full_synced_speech_track)
     logging.info("[ENHANCE] Applied once globally to synced speech track.")
-    return full_synced_speech_track
+    return full_synced_speech_track, tts_intervals
 
 
 def create_final_video(video_path: str, audio_path: str, output_path: str) -> None:
@@ -1351,6 +1452,9 @@ def process_video(
             original_audio_segment = AudioSegment.from_wav(extracted_audio_path)
             logging.info(f"Original audio duration: {len(original_audio_segment)/1000:.2f}s")
 
+            synced_translated_speech_track: Optional[AudioSegment] = None
+            tts_placement_intervals: List[Tuple[int, int]] = []
+
             with performance_monitor.timer("audio_synthesis_and_sync_pipeline"):
                 with TTSEngine(
                     mode=tts_mode,
@@ -1394,7 +1498,7 @@ def process_video(
                                 ).get("melo_language", "EN")
                                 tts_engine.load_melo(melo_lang)
 
-                    synced_translated_speech_track = create_synced_audio_track(
+                    synced_translated_speech_track, tts_placement_intervals = create_synced_audio_track(
                         original_audio_segment,
                         translated_segments,
                         target_language_code,
@@ -1404,6 +1508,9 @@ def process_video(
                     )
                 # TTSEngine context exits here.
 
+            if synced_translated_speech_track is None:
+                raise RuntimeError("Synthesis pipeline did not produce a synced speech track.")
+
             with performance_monitor.timer("audio_mixing_with_effects"):
                 final_mixed_audio_segment = preserve_sound_effects(
                     original_audio_segment,
@@ -1411,6 +1518,7 @@ def process_video(
                     transcript_data,
                     project_dir,
                     device_obj=device,
+                    tts_intervals=tts_placement_intervals,
                 )
 
             final_audio_output_path = os.path.join(project_dir, 'audio', 'final_audio.wav')
